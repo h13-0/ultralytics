@@ -768,7 +768,7 @@ class WorldModel(DetectionModel):
             if isinstance(m, C2fAttn):
                 x = m(x, txt_feats)
             elif isinstance(m, WorldDetect):
-                x = m(x, ori_txt_feats)
+                x = m(x, m.reprta(ori_txt_feats))
             elif isinstance(m, ImagePoolingAttn):
                 txt_feats = m(x, txt_feats)
             else:
