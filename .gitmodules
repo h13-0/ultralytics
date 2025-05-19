@@ -1,3 +1,6 @@
 [submodule "workspace"]
 	path = workspace
 	url = https://github.com/h13-0/workspace.git
+[submodule "workspaces"]
+	path = workspaces
+	url = https://github.com/h13-0/workspaces.git
