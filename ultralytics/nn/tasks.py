@@ -91,6 +91,7 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
+from workspaces.YOLOTVP import YOLOTVPDetect
 
 
 class BaseModel(torch.nn.Module):
@@ -784,6 +785,8 @@ class WorldModel(DetectionModel):
                 x = m(x, txt_feats)
             elif isinstance(m, WorldDetect):
                 x = m(x, m.reprta(ori_txt_feats))
+            elif isinstance(m, YOLOTVPDetect):
+                x = m(x, ori_txt_feats)
             elif isinstance(m, ImagePoolingAttn):
                 txt_feats = m(x, txt_feats)
             else:
@@ -1619,7 +1622,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
+            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect, YOLOTVPDetect)):
                 return "detect"
 
     # Guess from model filename
