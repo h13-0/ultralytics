@@ -3,6 +3,7 @@ from collections import OrderedDict
 
 import torch
 
+from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
 from ultralytics.data import build_yolo_dataset, build_grounding, YOLOConcatDataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionTrainer
@@ -159,7 +160,7 @@ class YOLOTVPTrainer(DetectionTrainer):
         return batch
 
 
-class YOLOTVPTrainerFromScratch(YOLOTVPTrainer):
+class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):
     """
     A class extending the WorldTrainer for training a world model from scratch on open-set datasets.
 
