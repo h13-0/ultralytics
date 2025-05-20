@@ -569,6 +569,48 @@ class YOLOESegment(YOLOEDetect):
 
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
+class YOLOTVPDetect(Detect):
+    """Head for integrating YOLO detection models with semantic understanding from text embeddings."""
+
+    def __init__(self, nc=80, embed=512, ch=()):
+        """Initialize YOLO detection layer with nc classes and layer channels ch."""
+        super().__init__(nc, ch)
+
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
+        )
+
+        self.cv3 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x + nc, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+
+    def forward(self, x, text):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if not  self.training:
+            pass
+        for i in range(self.nl):
+            cv2 = self.cv2[i](x[i])
+            cv3 = self.cv3[i](cv2, text)
+            cv4 = self.cv4[i](torch.cat((x[i], cv3), dim=1))
+            x[i] = torch.cat((cv4, cv3), dim=1)
+        if self.training:
+            return x
+        self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
 class RTDETRDecoder(nn.Module):
     """

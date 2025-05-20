@@ -88,6 +88,7 @@ from .head import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    YOLOTVPDetect,
 )
 from .transformer import (
     AIFI,
@@ -158,6 +159,7 @@ __all__ = (
     "WorldDetect",
     "YOLOEDetect",
     "YOLOESegment",
+    "YOLOTVPDetect",
     "v10Detect",
     "LRPCHead",
     "ImagePoolingAttn",

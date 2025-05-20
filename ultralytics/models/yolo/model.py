@@ -5,6 +5,7 @@ from pathlib import Path
 from ultralytics.data.build import load_inference_source
 from ultralytics.engine.model import Model
 from ultralytics.models import yolo
+from ultralytics.models.yolo.yolotvp import YOLOTVPTrainer
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
@@ -13,7 +14,7 @@ from ultralytics.nn.tasks import (
     SegmentationModel,
     WorldModel,
     YOLOEModel,
-    YOLOESegModel,
+    YOLOESegModel, YOLOTVPModel,
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -352,3 +353,54 @@ class YOLOE(Model):
             self.predictor = None  # reset predictor
 
         return super().predict(source, stream, **kwargs)
+
+class YOLOTVP(Model):
+    """YOLO-World object detection model."""
+
+    def __init__(self, model="yolo11-tvp.yaml", verbose=False) -> None:
+        """
+        Initialize YOLOv8-World model with a pre-trained model file.
+
+        Loads a YOLOv8-World model for object detection. If no custom class names are provided, it assigns default
+        COCO class names.
+
+        Args:
+            model (str | Path): Path to the pre-trained model file. Supports *.pt and *.yaml formats.
+            verbose (bool): If True, prints additional information during initialization.
+        """
+        super().__init__(model=model, task="detect", verbose=verbose)
+
+        # Assign default COCO class names when there are no custom names
+        if not hasattr(self.model, "names"):
+            self.model.names = yaml_load(ROOT / "cfg/datasets/coco8.yaml").get("names")
+
+    @property
+    def task_map(self):
+        """Map head to model, validator, and predictor classes."""
+        return {
+            "detect": {
+                "model": YOLOTVPModel,
+                "validator": yolo.detect.DetectionValidator,
+                "predictor": yolo.detect.DetectionPredictor,
+                "trainer": YOLOTVPTrainer,
+            }
+        }
+
+    def set_classes(self, classes):
+        """
+        Set the model's class names for detection.
+
+        Args:
+            classes (list[str]): A list of categories i.e. ["person"].
+        """
+        self.model.set_classes(classes)
+        # Remove background if it's given
+        background = " "
+        if background in classes:
+            classes.remove(background)
+        self.model.names = classes
+
+        # Reset method class names
+        if self.predictor:
+            self.predictor.model.names = classes
+
