@@ -1,14 +1,11 @@
 import itertools
-from collections import OrderedDict
-
 import torch
 
+from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
-from ultralytics.data import build_yolo_dataset, build_grounding, YOLOConcatDataset
-from ultralytics.data.utils import check_det_dataset
-from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.data import build_yolo_dataset
 from ultralytics.nn.tasks import YOLOTVPModel
-from ultralytics.utils import RANK, DEFAULT_CFG, checks
+from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER
 from ultralytics.utils.torch_utils import de_parallel
 
 
@@ -18,12 +15,8 @@ def on_pretrain_routine_end(trainer):
         # Set class names for evaluation
         names = [name.split("/")[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
         de_parallel(trainer.ema.ema).set_classes(names, cache_clip_model=False)
-    device = next(trainer.model.parameters()).device
-    trainer.text_model, _ = trainer.clip.load("ViT-B/32", device=device)
-    for p in trainer.text_model.parameters():
-        p.requires_grad_(False)
 
-class YOLOTVPTrainer(DetectionTrainer):
+class YOLOTVPTrainer(WorldTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
         Initialize a YOLOTVPTrainer object with given arguments.
@@ -36,16 +29,6 @@ class YOLOTVPTrainer(DetectionTrainer):
         if overrides is None:
             overrides = {}
         super().__init__(cfg, overrides, _callbacks)
-
-        # Import and assign clip
-        try:
-            import clip
-        except ImportError:
-            checks.check_requirements("git+https://github.com/ultralytics/CLIP.git")
-            import clip
-        self.clip = clip
-        self._text_feats = OrderedDict()
-        self._text_feats_num_limit = -1
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """
@@ -90,74 +73,31 @@ class YOLOTVPTrainer(DetectionTrainer):
             self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, multi_modal=mode == "train"
         )
 
-    def get_text_feats(self, texts: list[str], device, dtype) -> torch.Tensor:
+    def generate_text_embeddings(self, texts, batch, cache_dir):
         """
-        Get and cache the features of text.
+        Generate text embeddings for a list of text samples.
 
         Args:
-            texts (list[str]):
-            device (torch.device):
-            dtype (torch.dtype):
+            texts (List[str]): List of text samples to encode.
+            batch (int): Batch size for processing.
+            cache_dir (Path): Directory to save/load cached embeddings.
+
+        Returns:
+            (dict): Dictionary mapping text samples to their embeddings.
         """
-        # Find text features that have not appeared before.
-        seen = set()
-        new_texts = [
-            text for text in texts
-            if not (text in seen or seen.add(text))
-               and text not in self._text_feats
-        ]
-
-        if new_texts:
-            new_tokens = self.clip.tokenize(new_texts).to(device)
-            new_feats = self.text_model.encode_text(new_tokens).to(dtype=dtype)
-            # The new feature will be automatically placed at the end of the dict.
-            self._text_feats.update(zip(new_texts, new_feats))
-
-        # Splicing features into results
-        features = []
-        for text in texts:
-            # Move the features used to the end.
-            feat = self._text_feats[text]
-            self._text_feats.move_to_end(text)
-            features.append(feat)
-
-        # Cache management(LRU)
-        if self._text_feats_num_limit > 0:
-            while len(self._text_feats) > self._text_feats_num_limit:
-                # Retrieve the oldest unused features from the dict header.
-                oldest_key = next(iter(self._text_feats))
-                del self._text_feats[oldest_key]
-
-        return torch.stack(features, dim=0)
-
-    def set_cache_limit(self, num_limit: int):
-        """
-        Set a limit on the number of text feature caches.
-
-        There is no upper limit when the upper limit of quantity is less than 0(default is -1).
-
-        Args:
-            num_limit (int): Cache quantity limit, each cache will occupy about 2KB memory.
-
-        Examples:
-        >>> from ultralytics.models.yolo.world import WorldModel
-        >>> args = dict(model="yolov8s-world.pt", data="coco8.yaml", epochs=3)
-        >>> trainer = WorldTrainer(overrides=args)
-        >>> trainer.enable_cache_limit(409600) # Up to approximately 800MB of memory will be occupied.
-        >>> trainer.train()
-        """
-        self._text_feats_num_limit = num_limit
-
-    def preprocess_batch(self, batch):
-        """Preprocess a batch of images and text for YOLOWorld training."""
-        batch = super().preprocess_batch(batch)
-
-        # Add text features
-        texts = list(itertools.chain(*batch["texts"]))
-        txt_feats = self.get_text_feats(texts, device=batch["img"].device, dtype=batch["img"].dtype)
-        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
-        batch["txt_feats"] = txt_feats.reshape(len(batch["texts"]), -1, txt_feats.shape[-1])
-        return batch
+        model = "mobileclip:blt"
+        cache_path = cache_dir / f"text_embeddings_{model.replace(':', '_').replace('/', '_')}.pt"
+        if cache_path.exists():
+            LOGGER.info(f"Reading existed cache from '{cache_path}'")
+            txt_map = torch.load(cache_path)
+            if sorted(txt_map.keys()) == sorted(texts):
+                return txt_map
+        LOGGER.info(f"Caching text embeddings to '{cache_path}'")
+        assert self.model is not None
+        txt_feats = self.model.get_text_pe(texts, batch, cache_clip_model=False)
+        txt_map = dict(zip(texts, txt_feats.squeeze(0)))
+        torch.save(txt_map, cache_path)
+        return txt_map
 
 
 class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):
@@ -244,57 +184,7 @@ class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):
         Returns:
             (YOLOConcatDataset | Dataset): The constructed dataset for training or validation.
         """
-        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
-        if mode != "train":
-            return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
-        dataset = [
-            build_yolo_dataset(self.args, im_path, batch, self.data, stride=gs, multi_modal=True)
-            if isinstance(im_path, str)
-            else build_grounding(self.args, im_path["img_path"], im_path["json_file"], batch, stride=gs)
-            for im_path in img_path
-        ]
-        return YOLOConcatDataset(dataset) if len(dataset) > 1 else dataset[0]
-
-    def get_dataset(self):
-        """
-        Get train and validation paths from data dictionary.
-
-        Processes the data configuration to extract paths for training and validation datasets,
-        handling both YOLO detection datasets and grounding datasets.
-
-        Returns:
-            (str): Train dataset path.
-            (str): Validation dataset path.
-
-        Raises:
-            AssertionError: If train or validation datasets are not found, or if validation has multiple datasets.
-        """
-        final_data = {}
-        data_yaml = self.args.data
-        assert data_yaml.get("train", False), "train dataset not found"  # object365.yaml
-        assert data_yaml.get("val", False), "validation dataset not found"  # lvis.yaml
-        data = {k: [check_det_dataset(d) for d in v.get("yolo_data", [])] for k, v in data_yaml.items()}
-        assert len(data["val"]) == 1, f"Only support validating on 1 dataset for now, but got {len(data['val'])}."
-        val_split = "minival" if "lvis" in data["val"][0]["val"] else "val"
-        for d in data["val"]:
-            if d.get("minival") is None:  # for lvis dataset
-                continue
-            d["minival"] = str(d["path"] / d["minival"])
-        for s in ["train", "val"]:
-            final_data[s] = [d["train" if s == "train" else val_split] for d in data[s]]
-            # save grounding data if there's one
-            grounding_data = data_yaml[s].get("grounding_data")
-            if grounding_data is None:
-                continue
-            grounding_data = grounding_data if isinstance(grounding_data, list) else [grounding_data]
-            for g in grounding_data:
-                assert isinstance(g, dict), f"Grounding data should be provided in dict format, but got {type(g)}"
-            final_data[s] += grounding_data
-        # NOTE: to make training work properly, set `nc` and `names`
-        final_data["nc"] = data["val"][0]["nc"]
-        final_data["names"] = data["val"][0]["names"]
-        self.data = final_data
-        return final_data["train"], final_data["val"][0]
+        return WorldTrainerFromScratch.build_dataset(self, img_path, mode, batch)
 
     def plot_training_labels(self):
         """Do not plot labels for YOLO-World training."""

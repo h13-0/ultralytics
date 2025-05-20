@@ -6,6 +6,7 @@ from ultralytics.data.build import load_inference_source
 from ultralytics.engine.model import Model
 from ultralytics.models import yolo
 from ultralytics.models.yolo.yolotvp import YOLOTVPTrainer
+from ultralytics.models.yolo.yolotvp.valid import YOLOTVPValidator
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
@@ -380,7 +381,7 @@ class YOLOTVP(Model):
         return {
             "detect": {
                 "model": YOLOTVPModel,
-                "validator": yolo.detect.DetectionValidator,
+                "validator": YOLOTVPValidator,
                 "predictor": yolo.detect.DetectionPredictor,
                 "trainer": YOLOTVPTrainer,
             }
