@@ -1964,3 +1964,41 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+class ConstConv(nn.Module):
+    """Conv variable length channels into fixed channel outputs"""
+    def __init__(self, output_channels):
+        super().__init__()
+        self.output_channels = output_channels
+        self.conv = nn.Conv2d(1, output_channels, kernel_size=1)
+        self.bn = nn.BatchNorm2d(output_channels)
+
+    def forward(self, x):
+        #batch_size, n, h, w = x.shape
+        x = torch.sum(x, dim=1)
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        x = self.bn(x)
+        return x
+
+class TransformerAggregation(nn.Module):
+    def __init__(self, output_channels, h, w, d_model=64):
+        super().__init__()
+        self.output_channels = output_channels
+        self.query = nn.Parameter(torch.randn(output_channels, d_model))
+        self.channel_proj = nn.Linear(h * w, d_model)  # 假设H, W固定或动态调整
+
+    def forward(self, x):
+        batch_size, n, h, w = x.shape
+        # 将每个通道展平为向量
+        x = x.view(batch_size, n, -1)
+        if self.channel_proj.in_features > h * w:
+            x = F.pad(x, (0, self.channel_proj.in_features - h * w))
+        x = self.channel_proj(x)  # 形状: (batch_size, n, d_model)
+        # 计算交叉注意力
+        attn = torch.matmul(self.query, x.transpose(1, 2))  # 形状: (batch_size, k, n)
+        attn = torch.softmax(attn, dim=-1)
+        # 聚合到k个通道
+        x = torch.matmul(attn, x)  # 形状: (batch_size, k, H*W)
+        return x[:,:,0:h*w].view(batch_size, self.output_channels, h, w)
+

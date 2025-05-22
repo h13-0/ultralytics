@@ -12,7 +12,8 @@ from torch.nn.init import constant_, xavier_uniform_
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN, ConstConv, \
+    TransformerAggregation
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -584,8 +585,17 @@ class YOLOTVPDetect(Detect):
 
         self.cv3 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
-        self.cv4 = nn.ModuleList(
-            nn.Sequential(Conv(x + nc, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        self.cv4 = nn.ModuleList(ConstConv(64) for x in ch)
+        # self.cv4 = nn.ModuleList(
+        #     [
+        #         TransformerAggregation(64, 80, 80),
+        #         TransformerAggregation(64, 40, 40),
+        #         TransformerAggregation(64, 20, 20),
+        #     ]
+        # )
+
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
 
     def forward(self, x, text):
@@ -595,8 +605,9 @@ class YOLOTVPDetect(Detect):
         for i in range(self.nl):
             cv2 = self.cv2[i](x[i])
             cv3 = self.cv3[i](cv2, text)
-            cv4 = self.cv4[i](torch.cat((x[i], cv3), dim=1))
-            x[i] = torch.cat((cv4, cv3), dim=1)
+            cv4 = self.cv4[i](cv3)
+            cv5 = self.cv5[i](torch.cat((x[i], cv4), dim=1))
+            x[i] = torch.cat((cv5, cv3), dim=1)
         if self.training:
             return x
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
