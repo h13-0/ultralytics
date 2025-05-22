@@ -597,6 +597,7 @@ class YOLOTVPDetect(Detect):
         self.cv5 = nn.ModuleList(
             nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
+        self.reprta = Residual(SwiGLUFFN(embed, embed))
 
     def forward(self, x, text):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
