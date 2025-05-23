@@ -13,7 +13,7 @@ from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN, ConstConv, \
-    TransformerAggregation
+    TransformerAggregation, RConstConv
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -577,7 +577,7 @@ class YOLOTVPDetect(Detect):
         """Initialize YOLO detection layer with nc classes and layer channels ch."""
         super().__init__(nc, ch)
 
-        self.detect_with_text = False
+        self.detect_with_text = True
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
@@ -587,16 +587,15 @@ class YOLOTVPDetect(Detect):
 
         self.cv3 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
-        self.cv4 = nn.ModuleList(ConstConv(64) for x in ch)
-        # self.cv4 = nn.ModuleList(
-        #     [
-        #         TransformerAggregation(64, 80, 80),
-        #         TransformerAggregation(64, 40, 40),
-        #         TransformerAggregation(64, 20, 20),
-        #     ]
-        # )
-
         if self.detect_with_text:
+            self.cv4 = nn.ModuleList(RConstConv(64) for x in ch)
+            # self.cv4 = nn.ModuleList(
+            #     [
+            #         TransformerAggregation(64, 80, 80),
+            #         TransformerAggregation(64, 40, 40),
+            #         TransformerAggregation(64, 20, 20),
+            #     ]
+            # )
             self.cv5 = nn.ModuleList(
                 nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )

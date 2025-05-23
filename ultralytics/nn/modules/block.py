@@ -1981,6 +1981,29 @@ class ConstConv(nn.Module):
         x = self.bn(x)
         return x
 
+class RConstConv(nn.Module):
+    def __init__(self, output_channels):
+        super().__init__()
+        self.conv = nn.Sequential(Conv(1, 4, 3), Conv(4, 16, 3), nn.Conv2d(16, output_channels, 1))
+
+    def forward(self, x):
+        batch_size, in_channels, h, w = x.shape
+        out = None
+
+        # 分块处理输入通道
+        for i in range(0, in_channels, batch_size):
+            chunk = x[:, i:i + batch_size, :, :]                              # [B, B, H, W]
+            # 合并Batch和Chunk维度并行处理
+            chunk_reshaped = chunk.contiguous().view(batch_size * chunk.size(1), 1, h, w)  # [B^2, 1, H, W]
+            chunk_out = self.conv(chunk_reshaped)                             # [B^2, C_out, H, W]
+            # 恢复维度并求和
+            chunk_out = chunk_out.view(batch_size, chunk.size(1), -1, chunk_out.shape[-2], chunk_out.shape[-1])
+            chunk_out = chunk_out.sum(dim=1)                                  # [B, C_out, H', W']
+            # 累加到总输出
+            out = chunk_out if out is None else out + chunk_out
+        return out
+
+
 class TransformerAggregation(nn.Module):
     def __init__(self, output_channels, h, w, d_model=64):
         super().__init__()
