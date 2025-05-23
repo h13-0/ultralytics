@@ -577,6 +577,8 @@ class YOLOTVPDetect(Detect):
         """Initialize YOLO detection layer with nc classes and layer channels ch."""
         super().__init__(nc, ch)
 
+        self.detect_with_text = False
+
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
         self.cv2 = nn.ModuleList(
@@ -594,9 +596,14 @@ class YOLOTVPDetect(Detect):
         #     ]
         # )
 
-        self.cv5 = nn.ModuleList(
-            nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
-        )
+        if self.detect_with_text:
+            self.cv5 = nn.ModuleList(
+                nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            )
+        else:
+            self.cv5 = nn.ModuleList(
+                nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            )
         self.reprta = Residual(SwiGLUFFN(embed, embed))
 
     def forward(self, x, text):
@@ -606,8 +613,11 @@ class YOLOTVPDetect(Detect):
         for i in range(self.nl):
             cv2 = self.cv2[i](x[i])
             cv3 = self.cv3[i](cv2, text)
-            cv4 = self.cv4[i](cv3)
-            cv5 = self.cv5[i](torch.cat((x[i], cv4), dim=1))
+            if self.detect_with_text:
+                cv4 = self.cv4[i](cv3)
+                cv5 = self.cv5[i](torch.cat((x[i], cv4), dim=1))
+            else:
+                cv5 = self.cv5[i](x[i])
             x[i] = torch.cat((cv5, cv3), dim=1)
         if self.training:
             return x
