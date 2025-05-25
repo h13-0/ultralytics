@@ -85,8 +85,7 @@ class YOLOTVPTrainer(WorldTrainer):
         Returns:
             (dict): Dictionary mapping text samples to their embeddings.
         """
-        model = "clip:ViT-B/32"
-        cache_path = cache_dir / f"text_embeddings_{model.replace(':', '_').replace('/', '_')}.pt"
+        cache_path = cache_dir / f"text_embeddings_{self.model.variant.replace(':', '_').replace('/', '_')}.pt"
         if cache_path.exists():
             LOGGER.info(f"Reading existed cache from '{cache_path}'")
             txt_map = torch.load(cache_path)

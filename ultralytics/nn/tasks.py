@@ -1088,6 +1088,7 @@ class YOLOTVPModel(DetectionModel):
         self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
         self.clip_model = None  # CLIP model placeholder
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.variant = "clip:ViT-B/32"
 
     def set_classes(self, text, batch=80, cache_clip_model=True):
         """
@@ -1119,8 +1120,8 @@ class YOLOTVPModel(DetectionModel):
         device = next(self.model.parameters()).device
         if not getattr(self, "clip_model", None) and cache_clip_model:
             # For backwards compatibility of models lacking clip_model attribute
-            self.clip_model = build_text_model("clip:ViT-B/32", device=device)
-        model = self.clip_model if cache_clip_model else build_text_model("clip:ViT-B/32", device=device)
+            self.clip_model = build_text_model(self.variant, device=device)
+        model = self.clip_model if cache_clip_model else build_text_model(self.variant, device=device)
         text_token = model.tokenize(text)
         txt_feats = [model.encode_text(token).detach() for token in text_token.split(batch)]
         txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
