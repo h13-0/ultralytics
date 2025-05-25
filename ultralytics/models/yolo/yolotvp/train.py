@@ -85,7 +85,7 @@ class YOLOTVPTrainer(WorldTrainer):
         Returns:
             (dict): Dictionary mapping text samples to their embeddings.
         """
-        model = "mobileclip:blt"
+        model = "clip:ViT-B/32"
         cache_path = cache_dir / f"text_embeddings_{model.replace(':', '_').replace('/', '_')}.pt"
         if cache_path.exists():
             LOGGER.info(f"Reading existed cache from '{cache_path}'")

@@ -585,10 +585,17 @@ class YOLOTVPDetect(Detect):
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
         )
 
-        self.cv3 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+        # cls头的residual和BNContrast
+        self.residual1 = Residual(SwiGLUFFN(embed, embed))
+        self.cv31 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
         if self.detect_with_text:
+            # detect头的BNContrast
+            self.residual2 = Residual(SwiGLUFFN(embed, embed))
+            self.cv32 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+
             self.cv4 = nn.ModuleList(RConstConv(64) for x in ch)
+
             # self.cv4 = nn.ModuleList(
             #     [
             #         TransformerAggregation(64, 80, 80),
@@ -603,7 +610,7 @@ class YOLOTVPDetect(Detect):
             self.cv5 = nn.ModuleList(
                 nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )
-        self.reprta = Residual(SwiGLUFFN(embed, embed))
+
 
     def forward(self, x, text):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -611,13 +618,16 @@ class YOLOTVPDetect(Detect):
             pass
         for i in range(self.nl):
             cv2 = self.cv2[i](x[i])
-            cv3 = self.cv3[i](cv2, text)
+            text_cls = self.residual1(text)
+            cv31 = self.cv31[i](cv2, text_cls)
             if self.detect_with_text:
-                cv4 = self.cv4[i](cv3)
+                text_detect = self.residual2(text)
+                cv32 = self.cv32[i](cv2, text_detect)
+                cv4 = self.cv4[i](cv32)
                 cv5 = self.cv5[i](torch.cat((x[i], cv4), dim=1))
             else:
                 cv5 = self.cv5[i](x[i])
-            x[i] = torch.cat((cv5, cv3), dim=1)
+            x[i] = torch.cat((cv5, cv31), dim=1)
         if self.training:
             return x
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
