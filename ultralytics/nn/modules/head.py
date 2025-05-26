@@ -578,56 +578,68 @@ class YOLOTVPDetect(Detect):
         super().__init__(nc, ch)
 
         self.detect_with_text = True
+        self.indi = True
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
-        self.cv2 = nn.ModuleList(
+        del self.cv2
+
+        # cls头
+        self.img2embed_cls = nn.ModuleList(
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
         )
+        ## cls头的residual和BNContrast
+        self.residual_cls = Residual(SwiGLUFFN(embed, embed))
+        ## cls头的contrastive
+        self.contrast_cls = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
-        # cls头的residual和BNContrast
-        self.residual1 = Residual(SwiGLUFFN(embed, embed))
-        self.cv31 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+        if self.indi:
+            # detect头
+            self.img2embed_detect = nn.ModuleList(
+                nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
+            )
+            ## detect头的residual和BNContrast
+            self.residual_detect = Residual(SwiGLUFFN(embed, embed))
+            ## detect头的contrastive
+            self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
         if self.detect_with_text:
-            # detect头的BNContrast
-            self.residual2 = Residual(SwiGLUFFN(embed, embed))
-            self.cv32 = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
-
-            self.cv4 = nn.ModuleList(RConstConv(64) for x in ch)
-
-            # self.cv4 = nn.ModuleList(
+            self.text_to_detect = nn.ModuleList(RConstConv(64) for x in ch)
+            # self.text_to_detect = nn.ModuleList(
             #     [
             #         TransformerAggregation(64, 80, 80),
             #         TransformerAggregation(64, 40, 40),
             #         TransformerAggregation(64, 20, 20),
             #     ]
             # )
-            self.cv5 = nn.ModuleList(
+            self.detect = nn.ModuleList(
                 nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )
         else:
-            self.cv5 = nn.ModuleList(
+            self.detect = nn.ModuleList(
                 nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )
 
 
     def forward(self, x, text):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
-        if not  self.training:
+        if not self.training:
             pass
         for i in range(self.nl):
-            cv2 = self.cv2[i](x[i])
-            text_cls = self.residual1(text)
-            cv31 = self.cv31[i](cv2, text_cls)
-            if self.detect_with_text:
-                text_detect = self.residual2(text)
-                cv32 = self.cv32[i](cv2, text_detect)
-                cv4 = self.cv4[i](cv32)
-                cv5 = self.cv5[i](torch.cat((x[i], cv4), dim=1))
-            else:
-                cv5 = self.cv5[i](x[i])
-            x[i] = torch.cat((cv5, cv31), dim=1)
+            embed_cls = self.img2embed_cls[i](x[i])
+            text_cls = self.residual_cls(text)
+            contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
+
+            if self.indi:
+                embed_detect = self.img2embed_detect[i](x[i])
+                text_detect = self.residual_detect(text)
+                contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
+                if self.detect_with_text:
+                    text_to_detect = self.text_to_detect[i](contrast_detect)
+                    detect = self.detect[i](torch.cat((x[i], text_to_detect), dim=1))
+                else:
+                    detect = self.detect[i](x[i])
+            x[i] = torch.cat((detect, contrast_cls), dim=1)
         if self.training:
             return x
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
@@ -639,9 +651,17 @@ class YOLOTVPDetect(Detect):
         m = self  # self.model[-1]  # Detect() module
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
-        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+        for a, b, c, s in zip(m.detect, m.img2embed_cls, m.contrast_cls, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+            b[-1].bias.data[:] = 0.0
+            c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+
+        if self.indi:
+            for b, c, s in zip(m.img2embed_detect, m.contrast_detect, m.stride):  # from
+                b[-1].bias.data[:] = 0.0
+                c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+
 
 class RTDETRDecoder(nn.Module):
     """

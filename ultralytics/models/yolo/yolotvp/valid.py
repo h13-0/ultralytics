@@ -2,12 +2,13 @@ from copy import deepcopy
 
 import torch
 
+from ultralytics.data import build_yolo_dataset, build_grounding, YOLOConcatDataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.modules import YOLOTVPDetect
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import LOGGER, TQDM
-from ultralytics.utils.torch_utils import smart_inference_mode, select_device
+from ultralytics.utils.torch_utils import smart_inference_mode, select_device, de_parallel
 
 
 class YOLOTVPValidator(DetectionValidator):
