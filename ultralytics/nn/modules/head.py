@@ -589,7 +589,7 @@ class YOLOTVPDetect(Detect):
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
         )
         ## cls头的residual和BNContrast
-        self.residual_cls = Residual(SwiGLUFFN(embed, embed))
+        self.residual_cls = nn.Sequential(Residual(SwiGLUFFN(embed, embed)) for _ in range(3)) # Residual(SwiGLUFFN(embed, embed))
         ## cls头的contrastive
         self.contrast_cls = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
@@ -599,7 +599,7 @@ class YOLOTVPDetect(Detect):
                 nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
             )
             ## detect头的residual和BNContrast
-            self.residual_detect = Residual(SwiGLUFFN(embed, embed))
+            self.residual_detect = nn.Sequential(Residual(SwiGLUFFN(embed, embed)) for _ in range(3)) # Residual(SwiGLUFFN(embed, embed))
             ## detect头的contrastive
             self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
