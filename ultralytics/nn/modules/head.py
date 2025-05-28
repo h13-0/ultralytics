@@ -595,20 +595,21 @@ class YOLOTVPDetect(Detect):
         ## cls头的contrastive
         self.contrast_cls = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
-        if self.indi:
-            # detect头
-            self.img2embed_detect = nn.ModuleList(
-                nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
-            )
-            ## detect头的residual和BNContrast
-            self.residual_detect = nn.Sequential(
-                Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed))
-            ) # Residual(SwiGLUFFN(embed, embed))
-            ## detect头的contrastive
-            self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
-
         if self.detect_with_text:
             self.text_to_detect = nn.ModuleList(RConstConv(64) for x in ch)
+
+            if self.indi:
+                # detect头
+                self.img2embed_detect = nn.ModuleList(
+                    nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
+                )
+                ## detect头的residual和BNContrast
+                self.residual_detect = nn.Sequential(
+                    Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed)),
+                    Residual(SwiGLUFFN(embed, embed))
+                )  # Residual(SwiGLUFFN(embed, embed))
+                ## detect头的contrastive
+                self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
             self.detect = nn.ModuleList(
                 nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
@@ -628,13 +629,14 @@ class YOLOTVPDetect(Detect):
             text_cls = self.residual_cls(text)
             contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
 
-            if self.indi:
-                embed_detect = self.img2embed_detect[i](x[i])
-                text_detect = self.residual_detect(text)
-                contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
-
             if self.detect_with_text:
-                text_to_detect = self.text_to_detect[i](contrast_detect)
+                if self.indi:
+                    embed_detect = self.img2embed_detect[i](x[i])
+                    text_detect = self.residual_detect(text)
+                    contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
+                    text_to_detect = self.text_to_detect[i](contrast_detect)
+                else:
+                    text_to_detect = self.text_to_detect[i](contrast_cls)
                 detect = self.detect[i](torch.cat((x[i], text_to_detect), dim=1))
             else:
                 detect = self.detect[i](x[i])
