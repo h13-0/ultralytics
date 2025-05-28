@@ -577,8 +577,8 @@ class YOLOTVPDetect(Detect):
         """Initialize YOLO detection layer with nc classes and layer channels ch."""
         super().__init__(nc, ch)
 
-        self.detect_with_text = True
-        self.indi = True
+        self.detect_with_text = False
+        self.indi = False
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
@@ -634,11 +634,12 @@ class YOLOTVPDetect(Detect):
                 embed_detect = self.img2embed_detect[i](x[i])
                 text_detect = self.residual_detect(text)
                 contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
-                if self.detect_with_text:
-                    text_to_detect = self.text_to_detect[i](contrast_detect)
-                    detect = self.detect[i](torch.cat((x[i], text_to_detect), dim=1))
-                else:
-                    detect = self.detect[i](x[i])
+
+            if self.detect_with_text:
+                text_to_detect = self.text_to_detect[i](contrast_detect)
+                detect = self.detect[i](torch.cat((x[i], text_to_detect), dim=1))
+            else:
+                detect = self.detect[i](x[i])
             x[i] = torch.cat((detect, contrast_cls), dim=1)
         if self.training:
             return x
