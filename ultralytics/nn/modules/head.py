@@ -13,7 +13,7 @@ from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN, ConstConv, \
-    TransformerAggregation, RConstConv
+    TransformerAggregation, RConstConv, TextEncoderWithAttention
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -580,6 +580,9 @@ class YOLOTVPDetect(Detect):
         self.detect_with_text = False
         self.indi = False
 
+        # 捕获不同cls之间的信息
+        self.cls_attention = True
+
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
         del self.cv2
@@ -589,9 +592,10 @@ class YOLOTVPDetect(Detect):
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
         )
         ## cls头的residual和BNContrast
-        self.residual_cls = nn.Sequential(
-            Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed))
-        ) # Residual(SwiGLUFFN(embed, embed))
+        self.residual_cls = Residual(SwiGLUFFN(embed, embed))
+        if self.cls_attention:
+            self.residual_atten_cls = TextEncoderWithAttention(embed)
+
         ## cls头的contrastive
         self.contrast_cls = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
@@ -604,10 +608,9 @@ class YOLOTVPDetect(Detect):
                     nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
                 )
                 ## detect头的residual和BNContrast
-                self.residual_detect = nn.Sequential(
-                    Residual(SwiGLUFFN(embed, embed)), Residual(SwiGLUFFN(embed, embed)),
-                    Residual(SwiGLUFFN(embed, embed))
-                )  # Residual(SwiGLUFFN(embed, embed))
+                self.residual_detect = Residual(SwiGLUFFN(embed, embed))
+                if self.cls_attention:
+                    self.residual_atten_detect = TextEncoderWithAttention(embed)
                 ## detect头的contrastive
                 self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
 
@@ -627,12 +630,16 @@ class YOLOTVPDetect(Detect):
         for i in range(self.nl):
             embed_cls = self.img2embed_cls[i](x[i])
             text_cls = self.residual_cls(text)
+            if self.cls_attention:
+                text_cls = self.residual_atten_cls(text_cls)
             contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
 
             if self.detect_with_text:
                 if self.indi:
                     embed_detect = self.img2embed_detect[i](x[i])
                     text_detect = self.residual_detect(text)
+                    if self.cls_attention:
+                        text_detect = self.residual_atten_detect(text_detect)
                     contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
                     text_to_detect = self.text_to_detect[i](contrast_detect)
                 else:

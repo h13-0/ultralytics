@@ -2028,3 +2028,40 @@ class TransformerAggregation(nn.Module):
         x = torch.matmul(attn, x)  # 形状: (batch_size, k, H*W)
         return x[:,:,0:h*w].view(batch_size, self.output_channels, h, w)
 
+class TextEncoderWithAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, num_layers=1):
+        """
+        捕获不同类别之间的注意力, 例如猫和狗
+
+        Args:
+            embed_dim:
+            num_heads:
+            num_layers:
+        """
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim*4)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        # x: [num_classes, embed_dim]
+        for layer in self.layers:
+            x = layer(x)   # 自注意力处理
+        return x
+
+
+class TempScaledContrast(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)  # 可学习温度参数
+
+    def forward(self, img_feats, text_emb):
+        # 归一化
+        img_feats = F.normalize(img_feats, p=2, dim=1)
+        text_emb = F.normalize(text_emb, p=2, dim=1)
+
+        # 相似度计算
+        sim = torch.einsum('bchw,bc->bhw', img_feats, text_emb.squeeze(-1))
+        return sim / self.temperature.clamp(min=1e-8)
+
