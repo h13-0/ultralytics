@@ -629,17 +629,18 @@ class YOLOTVPDetect(Detect):
             pass
         for i in range(self.nl):
             embed_cls = self.img2embed_cls[i](x[i])
-            text_cls = self.residual_cls(text)
             if self.cls_attention:
-                text_cls = self.residual_atten_cls(text_cls)
+                text = self.residual_atten_cls(text)
+            text_cls = self.residual_cls(text)
             contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
 
             if self.detect_with_text:
                 if self.indi:
                     embed_detect = self.img2embed_detect[i](x[i])
-                    text_detect = self.residual_detect(text)
                     if self.cls_attention:
-                        text_detect = self.residual_atten_detect(text_detect)
+                        text = self.residual_atten_detect(text)
+                    text_detect = self.residual_detect(text)
+
                     contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
                     text_to_detect = self.text_to_detect[i](contrast_detect)
                 else:
