@@ -2049,19 +2049,3 @@ class TextEncoderWithAttention(nn.Module):
         for layer in self.layers:
             x = layer(x)   # 自注意力处理
         return x
-
-
-class TempScaledContrast(nn.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.temperature = nn.Parameter(torch.ones(1) * 0.07)  # 可学习温度参数
-
-    def forward(self, img_feats, text_emb):
-        # 归一化
-        img_feats = F.normalize(img_feats, p=2, dim=1)
-        text_emb = F.normalize(text_emb, p=2, dim=1)
-
-        # 相似度计算
-        sim = torch.einsum('bchw,bc->bhw', img_feats, text_emb.squeeze(-1))
-        return sim / self.temperature.clamp(min=1e-8)
-
