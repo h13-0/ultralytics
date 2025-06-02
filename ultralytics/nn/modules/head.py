@@ -580,8 +580,6 @@ class YOLOTVPDetect(Detect):
         self.detect_with_text = False
         self.indi = False
 
-        # 捕获不同cls之间的信息
-        self.cls_attention = True
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
@@ -593,11 +591,9 @@ class YOLOTVPDetect(Detect):
         )
         ## cls头的residual和BNContrast
         self.residual_cls = Residual(SwiGLUFFN(embed, embed))
-        if self.cls_attention:
-            self.residual_atten_cls = TextEncoderWithAttention(embed)
 
         ## cls头的contrastive
-        self.contrast_cls = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+        self.contrast_cls = nn.ModuleList(ContrastiveHead() for x in ch)
 
         if self.detect_with_text:
             self.text_to_detect = nn.ModuleList(RConstConv(64) for x in ch)
@@ -609,10 +605,8 @@ class YOLOTVPDetect(Detect):
                 )
                 ## detect头的residual和BNContrast
                 self.residual_detect = Residual(SwiGLUFFN(embed, embed))
-                if self.cls_attention:
-                    self.residual_atten_detect = TextEncoderWithAttention(embed)
                 ## detect头的contrastive
-                self.contrast_detect = nn.ModuleList(BNContrastiveHead(embed) for x in ch)
+                self.contrast_detect = nn.ModuleList(ContrastiveHead() for x in ch)
 
             self.detect = nn.ModuleList(
                 nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
@@ -629,16 +623,12 @@ class YOLOTVPDetect(Detect):
             pass
         for i in range(self.nl):
             embed_cls = self.img2embed_cls[i](x[i])
-            if self.cls_attention:
-                text = self.residual_atten_cls(text)
             text_cls = self.residual_cls(text)
             contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
 
             if self.detect_with_text:
                 if self.indi:
                     embed_detect = self.img2embed_detect[i](x[i])
-                    if self.cls_attention:
-                        text = self.residual_atten_detect(text)
                     text_detect = self.residual_detect(text)
 
                     contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
