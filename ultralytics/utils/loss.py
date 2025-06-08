@@ -751,63 +751,244 @@ class E2EDetectLoss:
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
 
 
-class TVPDetectLoss:
-    """Criterion class for computing training losses for text-visual prompt detection."""
+class TVPDetectionLoss(v8DetectionLoss):
+    """Criterion class for text-visual prompt detection with soft label cross-entropy."""
 
-    def __init__(self, model):
-        """Initialize TVPDetectLoss with task-prompt and visual-prompt criteria using the provided model."""
-        self.vp_criterion = v8DetectionLoss(model)
-        # NOTE: store following info as it's changeable in __call__
-        self.ori_nc = self.vp_criterion.nc
-        self.ori_no = self.vp_criterion.no
-        self.ori_reg_max = self.vp_criterion.reg_max
+    def __init__(self, model, tal_topk=10, tau_p=0.07, tau_q=0.05):
+        """Initialize with text-aware softmax parameters."""
+        super().__init__(model, tal_topk)
+        self.tau_p = tau_p  # Temperature for prediction distribution
+        self.tau_q = tau_q  # Temperature for target distribution
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        # Store original parameters that might change in __call__
+        self.ori_nc = self.nc
+        self.ori_no = self.no
+        self.ori_reg_max = self.reg_max
 
     def __call__(self, preds, batch):
-        """Calculate the loss for text-visual prompt detection."""
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        # Fallback to standard detection loss if not using text features
+        if not "txt_feats" in batch:
+            return super().__call__(preds, batch)
+
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
-        assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
+        # 将feats拆分为box和cls预测输出
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
 
-        if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
-            loss = torch.zeros(3, device=self.vp_criterion.device, requires_grad=True)
-            return loss, loss.detach()
+        ## pred_distri.shape = [batch, 8400, reg_max * 4]
+        ## pred_distri.shape = [batch, 8400, cls]
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
-        vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion(vp_feats, batch)
-        box_loss = vp_loss[0][1]
-        return box_loss, vp_loss[1]
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
+        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
+
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+
+
+
+        # Extract text features and normalize
+        text_features = batch.text_features.to(self.device)
+        text_features = F.normalize(text_features, p=2, dim=-1)
+
+        # Calculate text-text similarity matrix for soft labels
+        with torch.no_grad():
+            sim_text_text = text_features @ text_features.T
+            Q = torch.softmax(sim_text_text / self.tau_q, dim=-1)
+
+
+        # Compute text-aware classification loss
+        target_soft = torch.zeros_like(pred_scores)  # 初始为0
+
+        if assigned_cls.numel() > 0:
+            # 获取正样本的预测分数
+            pos_mask = (aligned_metric > 0)
+            pos_pred_scores = pred_scores[pos_mask]  # (num_pos, C)
+
+            # 创建软目标分布
+            pos_Q = Q_all[assigned_cls]  # (num_pos, C)
+
+            # 用任务对齐分数加权软目标
+            weighted_Q = pos_Q * aligned_metric[pos_mask].unsqueeze(1)
+
+            # 应用温度调整后的目标分布
+            target_soft[pos_mask] = weighted_Q
+
+
+
+
+
+        cls_loss = self._compute_tvp_loss(
+            pred_scores, target_scores, fg_mask,
+            text_features, Q, loss_items[1]
+        )
+
+        # Update classification loss component
+        loss[1] = cls_loss * self.hyp.cls
+
+
+
+
+
+
+
+
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        #loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+
 
     def _get_vp_features(self, feats):
-        """Extract visual-prompt features from the model output."""
+        """Extract visual-prompt features from model output."""
         vnc = feats[0].shape[1] - self.ori_reg_max * 4 - self.ori_nc
 
-        self.vp_criterion.nc = vnc
-        self.vp_criterion.no = vnc + self.vp_criterion.reg_max * 4
-        self.vp_criterion.assigner.num_classes = vnc
+        # Temporarily modify parameters for standard detection
+        self.nc = vnc
+        self.no = vnc + self.reg_max * 4
+        self.assigner.num_classes = vnc
 
         return [
             torch.cat((box, cls_vp), dim=1)
-            for box, _, cls_vp in [xi.split((self.ori_reg_max * 4, self.ori_nc, vnc), dim=1) for xi in feats]
+            for box, _, cls_vp in (
+                xi.split((self.ori_reg_max * 4, self.ori_nc, vnc), dim=1)
+                for xi in feats
+            )
         ]
 
+    def _compute_tvp_loss(self, pred_scores, target_scores, fg_mask,
+                          text_features, Q, base_cls_loss):
+        """Compute text-visual prompt classification loss."""
+        # Skip computation if no foreground samples
+        fg_mask = fg_mask.squeeze(-1)
+        if not fg_mask.any():
+            return base_cls_loss
 
-class TVPSegmentLoss(TVPDetectLoss):
-    """Criterion class for computing training losses for text-visual prompt segmentation."""
+        # Get indices of positive samples
+        pos_indices = fg_mask.nonzero(as_tuple=True)
+        batch_idx, anchor_idx = pos_indices
 
-    def __init__(self, model):
-        """Initialize TVPSegmentLoss with task-prompt and visual-prompt criteria using the provided model."""
-        super().__init__(model)
-        self.vp_criterion = v8SegmentationLoss(model)
+        # Get predicted scores and true classes for positive samples
+        pos_pred_scores = pred_scores[pos_indices]  # (num_pos, num_classes)
+        pos_target_scores = target_scores[pos_indices]  # (num_pos, num_classes)
+        pos_cls_idx = pos_target_scores.argmax(dim=1)  # (num_pos,)
 
-    def __call__(self, preds, batch):
-        """Calculate the loss for text-visual prompt segmentation."""
-        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
-        assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
+        # Calculate image-text similarity
+        image_features = pos_pred_scores  # Using scores as feature proxies
+        sim_img_text = image_features @ text_features.T  # (num_pos, num_classes)
 
-        if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
-            loss = torch.zeros(4, device=self.vp_criterion.device, requires_grad=True)
-            return loss, loss.detach()
+        # Compute soft cross-entropy loss
+        soft_ce_loss = self.soft_ce_loss(sim_img_text, Q[pos_cls_idx])
 
-        vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
-        cls_loss = vp_loss[0][2]
-        return cls_loss, vp_loss[1]
+        # Calculate standard BCE loss for comparison
+        bce_pos_loss = self.bce(pos_pred_scores, pos_target_scores).sum()
+
+        # Combine losses (weighted by number of positive samples)
+        num_pos = len(batch_idx)
+        total_loss = soft_ce_loss * num_pos + bce_pos_loss
+
+        # Scale to match original loss magnitude
+        return total_loss / (2 * num_pos) if num_pos > 0 else base_cls_loss
+
+
+
+
+class SoftBCEWithLogitsLoss(nn.Module):
+    def __init__(self, tau_q=0.05, reduction='sum'):
+        super(SoftBCEWithLogitsLoss, self).__init__()
+        self.tau_q = tau_q
+        self.reduction = reduction
+
+    def forward(self, pred_scores, text_features, assigned_cls, aligned_metric):
+        """
+        pred_scores: (batch_size, num_anchors, num_classes) 预测的类别分数
+        text_features: (num_classes, embed_dim) 文本特征向量
+        assigned_cls: (num_pos_anchors,) 正样本分配的类别索引
+        aligned_metric: (num_pos_anchors,) 任务对齐分数
+        """
+        device = pred_scores.device
+        num_classes = text_features.size(0)
+
+        # 1. 计算文本-文本相似度矩阵
+        norm_text = text_features / text_features.norm(dim=1, keepdim=True)
+        sim_text_text = norm_text @ norm_text.T  # (C, C)
+
+        # 2. 计算目标分布Q (考虑语义相似性)
+        Q_all = torch.softmax(sim_text_text / self.tau_q, dim=-1)  # (C, C)
+
+        # 3. 为每个锚点创建软目标
+        target_soft = torch.zeros_like(pred_scores)  # 初始为0
+
+        if assigned_cls.numel() > 0:
+            # 获取正样本的预测分数
+            pos_mask = (aligned_metric > 0)
+            pos_pred_scores = pred_scores[pos_mask]  # (num_pos, C)
+
+            # 创建软目标分布
+            pos_Q = Q_all[assigned_cls]  # (num_pos, C)
+
+            # 用任务对齐分数加权软目标
+            weighted_Q = pos_Q * aligned_metric[pos_mask].unsqueeze(1)
+
+            # 应用温度调整后的目标分布
+            target_soft[pos_mask] = weighted_Q
+
+        # 4. 计算带软目标的BCE损失
+        loss = F.binary_cross_entropy_with_logits(
+            pred_scores,
+            target_soft,
+            reduction='none'
+        )
+
+        # 5. 按任务对齐分数加权损失
+        weight_mask = torch.zeros_like(pred_scores)
+        if assigned_cls.numel() > 0:
+            weight_mask[pos_mask] = aligned_metric[pos_mask].unsqueeze(1)
+
+        weighted_loss = loss * weight_mask
+
+        if self.reduction == 'sum':
+            return weighted_loss.sum()
+        elif self.reduction == 'mean':
+            return weighted_loss.mean()
+        return weighted_loss

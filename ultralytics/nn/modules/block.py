@@ -1988,6 +1988,11 @@ class RConstConv(nn.Module):
         self.bn = nn.BatchNorm2d(output_channels)
 
     def forward(self, x):
+        ####注意或许可以使用tensor.expand代替循环!!!
+        ####注意或许可以使用tensor.expand代替循环!!!
+        ### 注意或许可以使用tensor.expand代替循环!!!
+        ###注意或许可以使用tensor.expand代替循环!!!
+        ###注意或许可以使用tensor.expand代替循环!!!
         batch_size, in_channels, h, w = x.shape
         out = None
 

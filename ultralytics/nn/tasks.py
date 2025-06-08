@@ -77,7 +77,7 @@ from ultralytics.utils.loss import (
     v8DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
-    v8SegmentationLoss,
+    v8SegmentationLoss, TVPDetectionLoss,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -1186,9 +1186,10 @@ class YOLOTVPModel(DetectionModel):
             preds = self.forward(batch["img"], txt_feats=batch["txt_feats"])
         return self.criterion(preds, batch)
 
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else TVPDetectionLoss(self)
 
-    def get_vision_prompt(self, img:torch.Tensor) -> torch.Tensor:
-        pass
 
 class Ensemble(torch.nn.ModuleList):
     """Ensemble of models."""
