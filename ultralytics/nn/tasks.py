@@ -1104,7 +1104,7 @@ class YOLOTVPModel(DetectionModel):
         self.names = check_class_names(names)
 
     @smart_inference_mode()
-    def get_text_pe(self, text, batch=80, cache_clip_model=True):
+    def get_text_pe(self, text, batch=80, cache_clip_model=False):
         """
         Set classes in advance so that model could do offline-inference without clip model.
 
