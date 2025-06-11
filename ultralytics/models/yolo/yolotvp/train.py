@@ -1,20 +1,23 @@
 import itertools
+from copy import copy
+
 import torch
 
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
 from ultralytics.data import build_yolo_dataset
+from .valid import YOLOTVPValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER
 from ultralytics.utils.torch_utils import de_parallel
 
 
-def on_pretrain_routine_end(trainer):
-    """Callback to set up model classes and text encoder at the end of the pretrain routine."""
-    if RANK in {-1, 0}:
-        # Set class names for evaluation
-        names = [name.split("/")[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
-        de_parallel(trainer.ema.ema).set_classes(names, cache_clip_model=False)
+# def on_pretrain_routine_end(trainer):
+#     """Callback to set up model classes and text encoder at the end of the pretrain routine."""
+#     if RANK in {-1, 0}:
+#         # Set class names for evaluation
+#         names = [name.split("/")[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
+#         de_parallel(trainer.ema.ema).set_classes(names, cache_clip_model=False)
 
 class YOLOTVPTrainer(WorldTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
@@ -40,7 +43,7 @@ class YOLOTVPTrainer(WorldTrainer):
             verbose (bool): Whether to display model info.
 
         Returns:
-            (WorldModel): Initialized WorldModel.
+            (TVPModel): Initialized TVPModel.
         """
         # NOTE: This `nc` here is the max number of different text samples in one image, rather than the actual `nc`.
         # NOTE: Following the official config, nc hard-coded to 80 for now.
@@ -52,7 +55,7 @@ class YOLOTVPTrainer(WorldTrainer):
         )
         if weights:
             model.load(weights)
-        self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
+        # self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
         return model
 
@@ -97,6 +100,28 @@ class YOLOTVPTrainer(WorldTrainer):
         txt_map = dict(zip(texts, txt_feats.squeeze(0)))
         torch.save(txt_map, cache_path)
         return txt_map
+
+    def get_validator(self):
+        """Returns a YOLOTVPValidator for YOLO model validation."""
+        self.loss_names = "box", "cls", "dfl"
+        return YOLOTVPValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+
+    def preprocess_batch(self, batch):
+        """Preprocess a batch of images and text for YOLOWorld training."""
+        batch = super().preprocess_batch(batch)
+
+        # Add text features
+        texts = list(itertools.chain(*batch["texts"]))
+        txt_feats = torch.stack([self.text_embeddings[text] for text in texts]).to(self.device)
+        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
+
+        # TODO: Add visual features
+
+        batch["embeddings"] = txt_feats.reshape(len(batch["texts"]), -1, txt_feats.shape[-1])
+        return batch
+
 
 
 class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):

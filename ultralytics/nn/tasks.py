@@ -1090,17 +1090,18 @@ class YOLOTVPModel(DetectionModel):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.variant = "clip:ViT-B/32"
 
-    def set_classes(self, text, batch=80, cache_clip_model=True):
+
+    def set_classes(self, names, embeddings):
         """
         Set classes in advance so that model could do offline-inference without clip model.
 
         Args:
-            text (List[str]): List of class names.
-            batch (int): Batch size for processing text tokens.
-            cache_clip_model (bool): Whether to cache the CLIP model.
+            names (List[str]): List of class names.
+            embeddings (torch.Tensor): Embeddings tensor.
         """
-        self.txt_feats = self.get_text_pe(text, batch=batch, cache_clip_model=cache_clip_model)
-        self.model[-1].nc = len(text)
+        self.txt_feats = embeddings
+        self.model[-1].nc = len(names)
+        self.names = check_class_names(names)
 
     @smart_inference_mode()
     def get_text_pe(self, text, batch=80, cache_clip_model=True):
