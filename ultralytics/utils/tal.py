@@ -483,7 +483,10 @@ class TVPTaskAlignedAssigner(TaskAlignedAssigner):
 
         # Calculate similarity matrix: (b, num_classes, num_classes)
         sim_matrix = torch.matmul(embeddings, embeddings.transpose(1, 2))
-        sim_matrix = sim_matrix.sigmoid() / 0.73106 # sigmoid(1)=0.73106
+
+        # sim_matrix = sim_matrix.sigmoid() / 0.73106 # sigmoid(1)=0.73106
+        # sim_matrix = (sim_matrix/0.05).sigmoid() / 0.73106 # sigmoid(1)=0.73106
+        sim_matrix = torch.softmax(sim_matrix / 0.05, dim=-1)
 
         # Create batch indices for similarity matrix lookup
         batch_idx = torch.arange(self.bs, device=target_labels.device)[:, None].expand(-1, target_labels.shape[1])
