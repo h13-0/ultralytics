@@ -486,7 +486,7 @@ class TVPTaskAlignedAssigner(TaskAlignedAssigner):
 
         # sim_matrix = sim_matrix.sigmoid() / 0.73106 # sigmoid(1)=0.73106
         # sim_matrix = (sim_matrix/0.05).sigmoid() / 0.73106 # sigmoid(1)=0.73106
-        sim_matrix = torch.softmax(sim_matrix * 100, dim=-1) # 或许可以考虑把最大cls归一化
+        sim_matrix = torch.softmax(sim_matrix * 75, dim=-1) # 或许可以考虑把最大cls归一化
 
         # # Normalization
         # diag = torch.diagonal(sim_matrix, dim1=1, dim2=2) # (b, num_cls)
