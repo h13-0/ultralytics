@@ -486,12 +486,12 @@ class TVPTaskAlignedAssigner(TaskAlignedAssigner):
 
         # sim_matrix = sim_matrix.sigmoid() / 0.73106 # sigmoid(1)=0.73106
         # sim_matrix = (sim_matrix/0.05).sigmoid() / 0.73106 # sigmoid(1)=0.73106
-        sim_matrix = torch.softmax(sim_matrix / 0.02, dim=-1) # 或许可以考虑把最大cls归一化
+        sim_matrix = torch.softmax(sim_matrix * 100, dim=-1) # 或许可以考虑把最大cls归一化
 
-        # Normalization
-        diag = torch.diagonal(sim_matrix, dim1=1, dim2=2) # (b, num_cls)
-        diag = diag.unsqueeze(-1)  # (b, num_cls, 1)
-        sim_matrix = sim_matrix / (diag + 1e-8)
+        # # Normalization
+        # diag = torch.diagonal(sim_matrix, dim1=1, dim2=2) # (b, num_cls)
+        # diag = diag.unsqueeze(-1)  # (b, num_cls, 1)
+        # sim_matrix = sim_matrix / (diag + 1e-8)
 
         # Create batch indices for similarity matrix lookup
         batch_idx = torch.arange(self.bs, device=target_labels.device)[:, None].expand(-1, target_labels.shape[1])
