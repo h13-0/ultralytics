@@ -1088,7 +1088,7 @@ class YOLOTVPModel(DetectionModel):
         self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
         self.clip_model = None  # CLIP model placeholder
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        self.variant = "clip:ViT-B/32"
+        self.variant = "mobileclip:blt"
 
 
     def set_classes(self, names, embeddings):
@@ -1119,7 +1119,7 @@ class YOLOTVPModel(DetectionModel):
         from ultralytics.nn.text_model import build_text_model
 
         device = next(self.model.parameters()).device
-        if not getattr(self, "clip_model", None) and cache_clip_model:
+        if not getattr(self, "mobileclip:blt", None) and cache_clip_model:
             # For backwards compatibility of models lacking clip_model attribute
             self.clip_model = build_text_model(self.variant, device=device)
         model = self.clip_model if cache_clip_model else build_text_model(self.variant, device=device)
