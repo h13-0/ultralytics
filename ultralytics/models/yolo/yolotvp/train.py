@@ -88,15 +88,19 @@ class YOLOTVPTrainer(WorldTrainer):
         Returns:
             (dict): Dictionary mapping text samples to their embeddings.
         """
-        cache_path = cache_dir / f"text_embeddings_{self.model.variant.replace(':', '_').replace('/', '_')}.pt"
+        if isinstance(self.model, YOLOTVPModel):
+            model = self.model
+        else:
+            model = self.model.module
+        cache_path = cache_dir / f"text_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt"
         if cache_path.exists():
             LOGGER.info(f"Reading existed cache from '{cache_path}'")
             txt_map = torch.load(cache_path)
             if sorted(txt_map.keys()) == sorted(texts):
                 return txt_map
         LOGGER.info(f"Caching text embeddings to '{cache_path}'")
-        assert self.model is not None
-        txt_feats = self.model.get_text_pe(texts, batch, cache_clip_model=False)
+        assert model is not None
+        txt_feats = model.get_text_pe(texts, batch, cache_clip_model=False)
         txt_map = dict(zip(texts, txt_feats.squeeze(0)))
         torch.save(txt_map, cache_path)
         return txt_map
