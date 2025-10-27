@@ -576,67 +576,34 @@ class YOLOTVPDetect(Detect):
         """Initialize YOLO detection layer with nc classes and layer channels ch."""
         super().__init__(nc, ch)
 
-        self.detect_with_text = False
-        self.indi = False
-
-
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
 
         del self.cv2
 
         # cls头
-        self.img2embed_cls = nn.ModuleList(
+        self.backbone2embed = nn.ModuleList(
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
         )
-        ## cls头的residual和BNContrast
-        self.residual_cls = Residual(SwiGLUFFN(embed, embed))
+
+        # 图像残差头(多模态融合)
+        self.img_prompt_residual = Residual(SwiGLUFFN(embed, embed))
 
         ## cls头的contrastive
         self.contrast_cls = nn.ModuleList(ContrastiveHead() for x in ch)
 
-        if self.detect_with_text:
-            self.text_to_detect = nn.ModuleList(RConstConv(64) for x in ch)
-
-            if self.indi:
-                # detect头
-                self.img2embed_detect = nn.ModuleList(
-                    nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
-                )
-                ## detect头的residual和BNContrast
-                self.residual_detect = Residual(SwiGLUFFN(embed, embed))
-                ## detect头的contrastive
-                self.contrast_detect = nn.ModuleList(ContrastiveHead() for x in ch)
-
-            self.detect = nn.ModuleList(
-                nn.Sequential(Conv(x + 64, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
-            )
-        else:
-            self.detect = nn.ModuleList(
-                nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
-            )
+        self.detect = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
 
 
-    def forward(self, x, text):
+    def forward(self, x, text_embed):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         if not self.training:
             pass
         for i in range(self.nl):
-            embed_cls = self.img2embed_cls[i](x[i])
-            text_cls = self.residual_cls(text)
-            contrast_cls = self.contrast_cls[i](embed_cls, text_cls)
-
-            if self.detect_with_text:
-                if self.indi:
-                    embed_detect = self.img2embed_detect[i](x[i])
-                    text_detect = self.residual_detect(text)
-
-                    contrast_detect = self.contrast_detect[i](embed_detect, text_detect)
-                    text_to_detect = self.text_to_detect[i](contrast_detect)
-                else:
-                    text_to_detect = self.text_to_detect[i](contrast_cls)
-                detect = self.detect[i](torch.cat((x[i], text_to_detect), dim=1))
-            else:
-                detect = self.detect[i](x[i])
+            embed_cls = self.backbone2embed[i](x[i])
+            contrast_cls = self.contrast_cls[i](embed_cls, text_embed)
+            detect = self.detect[i](x[i])
             x[i] = torch.cat((detect, contrast_cls), dim=1)
         if self.training:
             return x
