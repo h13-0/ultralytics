@@ -616,16 +616,11 @@ class YOLOTVPDetect(Detect):
         m = self  # self.model[-1]  # Detect() module
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
-        for a, b, c, s in zip(m.detect, m.img2embed_cls, m.contrast_cls, m.stride):  # from
+        for a, b, c, s in zip(m.detect, m.backbone2embed, m.contrast_cls, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
             b[-1].bias.data[:] = 0.0
             c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
-
-        if self.indi:
-            for b, c, s in zip(m.img2embed_detect, m.contrast_detect, m.stride):  # from
-                b[-1].bias.data[:] = 0.0
-                c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
 
 
 class RTDETRDecoder(nn.Module):
