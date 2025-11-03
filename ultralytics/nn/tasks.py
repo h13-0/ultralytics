@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1085,10 +1086,10 @@ class YOLOTVPModel(DetectionModel):
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
         """
-        self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
-        self.clip_model = None  # CLIP model placeholder
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.variant = "mobileclip:blt"
+        self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
+        self.clip_model = None
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
 
     def set_classes(self, names, embeddings):
@@ -1119,17 +1120,62 @@ class YOLOTVPModel(DetectionModel):
         from ultralytics.nn.text_model import build_text_model
 
         device = next(self.model.parameters()).device
-        if not getattr(self, "mobileclip:blt", None) and cache_clip_model:
-            # For backwards compatibility of models lacking clip_model attribute
-            self.clip_model = build_text_model(self.variant, device=device)
-        model = self.clip_model if cache_clip_model else build_text_model(self.variant, device=device)
-        text_token = model.tokenize(text)
-        txt_feats = [model.encode_text(token).detach() for token in text_token.split(batch)]
+        if cache_clip_model:
+            if getattr(self, "clip_model", None) is None:
+                self.clip_model = build_text_model(self.variant, device=device)
+            clip_model = self.clip_model
+        else:
+            clip_model = build_text_model(self.variant, device=device)
+
+        tokens = clip_model.tokenize(text)
+        txt_feats = []
+        for token_chunk in tokens.split(batch):
+            with torch.no_grad():
+                feats = clip_model.encode_text(token_chunk, dtype=torch.float32)
+            txt_feats.append(feats.detach())
         txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
+        txt_feats = F.normalize(txt_feats, dim=-1, eps=1e-6)
+        txt_feats = txt_feats.to(dtype=next(self.model.parameters()).dtype)
         return txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
 
+    @smart_inference_mode()
+    def get_visual_pe(self, img, visual=None):
+        """
+        Encode visual prompts.
 
-    def predict(self, x, profile=False, visualize=False, txt_feats=None, augment=False, embed=None):
+        - 在训练模式或未提供额外视觉提示信息时，仅对输入图像进行 CLIP 编码；
+        - 在验证/推理模式下，复用 YOLOEModel 中的视觉提示逻辑（支持 bbox/mask 等）。
+
+        Args:
+            img (torch.Tensor | PIL.Image | List): 输入图像。
+            visual (Any, optional): 视觉提示结构，验证阶段会传入。
+
+        Returns:
+            (torch.Tensor): 视觉提示嵌入。
+        """
+        if visual is None:
+            from ultralytics.nn.text_model import build_text_model
+
+            device = next(self.model.parameters()).device
+            if getattr(self, "clip_model", None) is None:
+                self.clip_model = build_text_model(self.variant, device=device)
+            clip_model = self.clip_model
+
+            processed = clip_model.preprocess_images(img)
+            if isinstance(processed, (list, tuple)):
+                processed = torch.stack(processed, dim=0)
+            processed = processed.to(device)
+
+            with torch.no_grad():
+                feats = clip_model.encode_image(processed, preprocess=False, dtype=torch.float32)
+            feats = F.normalize(feats, dim=-1, eps=1e-6)
+            target_dtype = next(self.model.parameters()).dtype
+            return feats.to(dtype=target_dtype, device=device)
+
+        return self(img, vpe=visual, return_vpe=True)
+
+
+    def predict(self, x, profile=False, visualize=False, txt_feats=None, visuals=None, augment=False, embed=None):
         """
         Perform a forward pass through the model.
 
@@ -1138,6 +1184,7 @@ class YOLOTVPModel(DetectionModel):
             profile (bool): If True, profile the computation time for each layer.
             visualize (bool): If True, save feature maps for visualization.
             txt_feats (torch.Tensor, optional): The text features, use it if it's given.
+            visuals (torch.Tensor, optional): Visual prompts aligned with the text prompts.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of feature vectors/embeddings to return.
 
@@ -1148,6 +1195,14 @@ class YOLOTVPModel(DetectionModel):
         if len(txt_feats) != len(x) or self.model[-1].export:
             txt_feats = txt_feats.expand(x.shape[0], -1, -1)
         ori_txt_feats = txt_feats.clone()
+        visuals_embed = None
+        if visuals is not None:
+            visuals_embed = visuals.to(device=x.device, dtype=x.dtype)
+            if visuals_embed.ndim == 3 and visuals_embed.shape[0] != x.shape[0]:
+                visuals_embed = visuals_embed.expand(x.shape[0], -1, -1)
+            elif visuals_embed.ndim == 4 and visuals_embed.shape[0] != x.shape[0]:
+                visuals_embed = visuals_embed.expand(x.shape[0], -1, -1, -1)
+        ori_visuals = visuals_embed.clone() if visuals_embed is not None else None
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:  # except the head part
             if m.f != -1:  # if not from previous layer
@@ -1157,7 +1212,7 @@ class YOLOTVPModel(DetectionModel):
             if isinstance(m, C2fAttn):
                 x = m(x, txt_feats)
             elif isinstance(m, YOLOTVPDetect):
-                x = m(x, ori_txt_feats)
+                x = m(x, ori_txt_feats, ori_visuals)
             elif isinstance(m, ImagePoolingAttn):
                 txt_feats = m(x, txt_feats)
             else:
@@ -1184,7 +1239,9 @@ class YOLOTVPModel(DetectionModel):
             self.criterion = self.init_criterion()
 
         if preds is None:
-            preds = self.forward(batch["img"], txt_feats=batch["txt_feats"])
+            txt_feats = batch.get("txt_feats", batch.get("embeddings"))
+            visuals = batch.get("visual_feats", batch.get("visuals"))
+            preds = self.forward(batch["img"], txt_feats=txt_feats, visuals=visuals)
         return self.criterion(preds, batch)
 
     def init_criterion(self):
