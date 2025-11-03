@@ -33,14 +33,22 @@ class TextModel(nn.Module):
         super().__init__()
 
     @abstractmethod
-    def tokenize(texts):
+    def tokenize(self, texts):
         """Convert input texts to tokens for model processing."""
         pass
 
     @abstractmethod
-    def encode_text(texts, dtype):
+    def encode_text(self, texts, dtype):
         """Encode tokenized texts into normalized feature vectors."""
         pass
+
+    def preprocess_images(self, images):
+        """Preprocess image inputs before encoding. Subclasses should override if image encoding is supported."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement image preprocessing.")
+
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """Encode image inputs into feature vectors. Subclasses should override if image encoding is supported."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement image encoding.")
 
 
 class CLIP(TextModel):
@@ -86,7 +94,8 @@ class CLIP(TextModel):
             >>> text_features = clip_model.encode_text(["a photo of a cat", "a photo of a dog"])
         """
         super().__init__()
-        self.model = clip.load(size, device=device)[0]
+        self.model, preprocess = clip.load(size, device=device)
+        self.preprocess = preprocess
         self.to(device)
         self.device = device
         self.eval()
@@ -133,6 +142,59 @@ class CLIP(TextModel):
         txt_feats = self.model.encode_text(texts).to(dtype)
         txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
         return txt_feats
+
+    def preprocess_images(self, images):
+        """
+        Apply CLIP preprocessing to image inputs.
+
+        Args:
+            images (list | tuple | torch.Tensor | PIL.Image): Image data to preprocess.
+
+        Returns:
+            (torch.Tensor): Preprocessed image batch tensor.
+        """
+        if isinstance(images, torch.Tensor):
+            return images if images.ndim == 4 else images.unsqueeze(0)
+
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        to_pil_image = None
+        processed = []
+        for img in images:
+            if isinstance(img, torch.Tensor):
+                if to_pil_image is None:
+                    try:
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    except ImportError:
+                        checks.check_requirements("torchvision")
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    to_pil_image = _to_pil_image
+                img = to_pil_image(img.cpu())
+            processed.append(self.preprocess(img))
+        return torch.stack(processed, dim=0)
+
+    @smart_inference_mode()
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """
+        Encode images into CLIP visual embeddings.
+
+        Args:
+            images (Any): Image inputs compatible with ``preprocess_images`` or already preprocessed tensors.
+            preprocess (bool): Whether to run preprocessing before encoding.
+            dtype (torch.dtype): Desired output dtype.
+
+        Returns:
+            (torch.Tensor): L2-normalized image embeddings.
+        """
+        if preprocess:
+            images = self.preprocess_images(images)
+        if isinstance(images, (list, tuple)):
+            images = torch.stack(images, dim=0)
+        images = images.to(self.device)
+        feats = self.model.encode_image(images).to(dtype)
+        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+        return feats
 
 
 class MobileCLIP(TextModel):
@@ -197,7 +259,9 @@ class MobileCLIP(TextModel):
             from ultralytics import download
 
             download(f"https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/{file}")
-        self.model = mobileclip.create_model_and_transforms(f"mobileclip_{config}", pretrained=file, device=device)[0]
+        model, _, transforms = mobileclip.create_model_and_transforms(f"mobileclip_{config}", pretrained=file, device=device)
+        self.model = model
+        self.preprocess = transforms[-1] if isinstance(transforms, (tuple, list)) else transforms
         self.tokenizer = mobileclip.get_tokenizer(f"mobileclip_{config}")
         self.to(device)
         self.device = device
@@ -241,6 +305,59 @@ class MobileCLIP(TextModel):
         text_features = self.model.encode_text(texts).to(dtype)
         text_features /= text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features
+
+    def preprocess_images(self, images):
+        """
+        Apply MobileCLIP preprocessing to image inputs.
+
+        Args:
+            images (list | tuple | torch.Tensor | PIL.Image): Image data to preprocess.
+
+        Returns:
+            (torch.Tensor): Preprocessed image batch tensor.
+        """
+        if isinstance(images, torch.Tensor):
+            return images if images.ndim == 4 else images.unsqueeze(0)
+
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        to_pil_image = None
+        processed = []
+        for img in images:
+            if isinstance(img, torch.Tensor):
+                if to_pil_image is None:
+                    try:
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    except ImportError:
+                        checks.check_requirements("torchvision")
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    to_pil_image = _to_pil_image
+                img = to_pil_image(img.cpu())
+            processed.append(self.preprocess(img))
+        return torch.stack(processed, dim=0)
+
+    @smart_inference_mode()
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """
+        Encode images into MobileCLIP visual embeddings.
+
+        Args:
+            images (Any): Image inputs compatible with ``preprocess_images`` or preprocessed tensors.
+            preprocess (bool): Whether to apply preprocessing before encoding.
+            dtype (torch.dtype): Desired output dtype.
+
+        Returns:
+            (torch.Tensor): L2-normalized image embeddings.
+        """
+        if preprocess:
+            images = self.preprocess_images(images)
+        if isinstance(images, (list, tuple)):
+            images = torch.stack(images, dim=0)
+        images = images.to(self.device)
+        feats = self.model.encode_image(images).to(dtype)
+        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+        return feats
 
 
 class MobileCLIPTS(TextModel):
@@ -347,6 +464,6 @@ def build_text_model(variant, device=None):
     if base == "clip":
         return CLIP(size, device)
     elif base == "mobileclip":
-        return MobileCLIPTS(device)
+        return MobileCLIP(size, device)
     else:
         raise ValueError(f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip'.")
