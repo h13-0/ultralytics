@@ -1118,8 +1118,6 @@ class YOLOTVPModel(DetectionModel):
         Returns:
             (torch.Tensor): Text positional embeddings.
         """
-        from ultralytics.nn.text_model import build_text_model
-
         device = next(self.model.parameters()).device
         clip_model = self._get_clip_model(self.variant, device=device, cache=cache_clip_model)
 
@@ -1144,7 +1142,7 @@ class YOLOTVPModel(DetectionModel):
 
         Args:
             img (torch.Tensor | PIL.Image | List): 输入图像。
-            visual (Any, optional): 视觉提示结构，验证阶段会传入。
+            visual (bool): If True, save feature maps for visualization.
 
         Returns:
             (torch.Tensor): 视觉提示嵌入。

@@ -9,11 +9,10 @@ import torch.nn.functional as F
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
-from ultralytics.data import build_yolo_dataset
-from ultralytics.data.utils import check_det_dataset
+from ultralytics.data import build_dataloader
 from .valid import YOLOTVPValidator
 from ultralytics.nn.tasks import YOLOTVPModel
-from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER
+from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER, TQDM
 from ultralytics.utils.torch_utils import de_parallel, strip_optimizer
 
 
@@ -63,24 +62,6 @@ class YOLOTVPTrainer(WorldTrainer):
         # self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
         return model
-
-
-    def build_dataset(self, img_path, mode="train", batch=None):
-        """
-        Build YOLO Dataset for training or validation.
-
-        Args:
-            img_path (str): Path to the folder containing images.
-            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
-            batch (int, optional): Size of batches, this is for `rect`.
-
-        Returns:
-            (Dataset): YOLO dataset configured for training or validation.
-        """
-        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(
-            self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, multi_modal=mode == "train"
-        )
 
     def generate_text_embeddings(self, texts, batch, cache_dir):
         """
@@ -257,6 +238,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         if overrides is None:
             overrides = {}
         super().__init__(cfg, overrides, _callbacks)
+        self.visual_embeddings = None
 
     @staticmethod
     def _crop_region(image_tensor, bbox_tensor):
@@ -338,7 +320,6 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                 num_boxes = bboxes_cpu.shape[0]
             else:
                 num_boxes = 0
-            per_image_counts = torch.bincount(batch_indices_cpu, minlength=batch_size)
 
         if num_boxes == 0:
             batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device)
@@ -366,7 +347,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             valid_indices.append(idx)
 
         if crops:
-            encoded = model.get_visual_pe(crops)
+            encoded = torch.stack([self.visual_embeddings[crop] for crop in crops], dim=0)
             encoded = encoded.to(device=device, dtype=imgs.dtype)
             for embed, idx in zip(encoded, valid_indices):
                 visual_embeds[idx] = embed
@@ -421,3 +402,100 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                     self.metrics = self.validator(model=f, load_vp=True)
                     self.metrics.pop("fitness", None)
                     self.run_callbacks("on_fit_epoch_end")
+
+    def build_dataset(self, img_path, mode="train", batch=None):
+        """
+        Build YOLO Dataset for training or validation.
+
+        This method constructs appropriate datasets based on the mode and input paths, handling both
+        standard YOLO datasets and grounding datasets with different formats.
+
+        Args:
+            img_path (List[str] | str): Path to the folder containing images or list of paths.
+            mode (str): 'train' mode or 'val' mode, allowing customized augmentations for each mode.
+            batch (int, optional): Size of batches, used for rectangular training/validation.
+
+        Returns:
+            (YOLOConcatDataset | Dataset): The constructed dataset for training or validation.
+        """
+        datasets = WorldTrainerFromScratch.build_dataset(self, img_path, mode, batch)
+        self.set_visual_embeddings(datasets, batch)
+        return datasets
+
+    def get_batch_crops(self, batch):
+        """
+        Extract cropped image patches for all bounding boxes in the batch.
+        Args:
+            batch (dict): Batch dictionary containing keys 'img', 'bboxes', and 'batch_idx'.
+        Returns:
+            List[torch.Tensor]: List of cropped image tensors (each in CHW format on CPU).
+        """
+        imgs = batch["img"]
+        bboxes = batch.get("bboxes")
+        batch_indices = batch.get("batch_idx")
+        if bboxes is None or batch_indices is None:
+            raise KeyError("Batch must contain 'bboxes' and 'batch_idx' to extract crops.")
+        bboxes_cpu = bboxes.cpu()
+        batch_indices_cpu = batch_indices.long().cpu()
+        image_cache = {}
+        crops = []
+        for bbox, img_idx_tensor in zip(bboxes_cpu, batch_indices_cpu):
+            img_idx = int(img_idx_tensor.item())
+            if img_idx not in image_cache:
+                image_cache[img_idx] = imgs[img_idx].detach().cpu()
+            crop = self._crop_region(image_cache[img_idx], bbox)
+            if crop is not None:
+                crops.append(crop)
+        return crops
+
+    def set_visual_embeddings(self, datasets, batch_size):
+        """
+        Set visual embeddings for datasets to accelerate training by caching category names.
+
+        This method collects unique category names from all datasets, then generates and caches text embeddings
+        for these categories to improve training efficiency.
+
+        Args:
+            datasets (List[Dataset]): List of datasets from which to extract category names.
+            batch_size (int | None): Batch size used for processing.
+
+        Notes:
+            This method collects category names from datasets that have the 'category_names' attribute,
+            then uses the first dataset's image path to determine where to cache the generated text embeddings.
+        """
+        visual_embeddings = {}
+        desc = "Obtain and cache the image embeddings"
+
+        model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
+        assert model is not None
+
+        for dataset in datasets.datasets:
+            visual_map = {}
+            cache_path = (
+                    Path(dataset.img_path).parent /
+                    f"visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
+            if cache_path.exists():
+                LOGGER.info(f"Reading existed cache from '{cache_path}'")
+                visual_map = torch.load(cache_path)
+
+            dataloader = build_dataloader(
+                dataset=dataset,
+                batch=batch_size,
+                workers=4,
+                shuffle=True,
+                rank=-1,
+            )
+            pbar = TQDM(dataloader, total=len(dataloader), desc=desc)
+            for batch in pbar:
+                crops = self.get_batch_crops(batch)
+
+                miss_crops = [crop for crop in crops if crop not in visual_map]
+                if miss_crops:
+                    feats = model.get_visual_pe(miss_crops)
+                    visual_map.update(zip(miss_crops, feats.squeeze(0)))
+
+                visual_embeddings.update(visual_map)
+
+            LOGGER.info(f"Caching text embeddings to '{cache_path}'")
+            torch.save(visual_map, cache_path)
+        self.visual_embeddings = visual_embeddings
