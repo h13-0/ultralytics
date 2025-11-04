@@ -64,70 +64,6 @@ class YOLOTVPTrainer(WorldTrainer):
 
         return model
 
-    def get_dataset(self):
-        """
-        Support both YAML-style strings and dictionary specifications for datasets.
-
-        When a dictionary is provided (as in multi-source training setups), consolidate metadata in a format
-        compatible with the wider YOLO training pipeline and keep track of per-dataset details for later use.
-        """
-        data_cfg = self.args.data
-        if isinstance(data_cfg, dict):
-            assert data_cfg.get("train"), "train dataset not found in data dict."
-            assert data_cfg.get("val"), "validation dataset not found in data dict."
-
-            data_entries = {
-                split: [check_det_dataset(d) for d in spec.get("yolo_data", [])] for split, spec in data_cfg.items()
-            }
-            assert data_entries["val"], "At least one validation dataset must be provided."
-            assert (
-                len(data_entries["val"]) == 1
-            ), f"Only support validating on 1 dataset for now, but got {len(data_entries['val'])}."
-
-            val_meta = data_entries["val"][0]
-            val_split = "minival" if "lvis" in val_meta.get("val", "") else "val"
-            if val_meta.get("minival") is not None:
-                val_meta["minival"] = str(Path(val_meta["path"]) / val_meta["minival"])
-
-            final_data = {}
-            for split in ("train", "val"):
-                split_paths = []
-                for det_dataset in data_entries[split]:
-                    if split == "train":
-                        split_paths.append(det_dataset["train"])
-                    else:
-                        if det_dataset.get("minival") is not None and val_split == "minival":
-                            split_paths.append(det_dataset["minival"])
-                        else:
-                            split_paths.append(det_dataset[val_split])
-                grounding = data_cfg[split].get("grounding_data")
-                if grounding:
-                    grounding = grounding if isinstance(grounding, list) else [grounding]
-                    for gd in grounding:
-                        assert isinstance(gd, dict), f"Grounding data should be dict, but got {type(gd)}"
-                    split_paths.extend(grounding)
-                final_data[split] = split_paths
-
-            final_data["nc"] = val_meta["nc"]
-            final_data["names"] = val_meta["names"]
-            final_data["path"] = val_meta["path"]
-            final_data["channels"] = val_meta["channels"]
-            self.data = final_data
-
-            if self.args.single_cls:
-                LOGGER.info("Overriding class names with single class.")
-                self.data["names"] = {0: "object"}
-                self.data["nc"] = 1
-
-            self.training_data = {}
-            for det_dataset in data_entries["train"]:
-                if self.args.single_cls:
-                    det_dataset["names"] = {0: "object"}
-                    det_dataset["nc"] = 1
-                self.training_data[det_dataset["train"]] = det_dataset
-            return final_data
-
-        return super().get_dataset()
 
     def build_dataset(self, img_path, mode="train", batch=None):
         """
@@ -199,161 +135,6 @@ class YOLOTVPTrainer(WorldTrainer):
         batch["txt_feats"] = txt_feats
         batch["embeddings"] = txt_feats
         return batch
-
-
-class YOLOTVPVPTrainer(YOLOTVPTrainer):
-    """Trainer for learning visual prompts alongside text prompts."""
-
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        """
-        Initialize the visual prompt trainer.
-
-        Args:
-            cfg (dict): Trainer configuration.
-            overrides (dict, optional): Configuration overrides.
-            _callbacks (list, optional): Callback functions.
-        """
-        super().__init__(cfg, overrides, _callbacks)
-
-    @staticmethod
-    def _crop_region(image_tensor, bbox_tensor):
-        """
-        Crop a region from ``image_tensor`` using a normalized ``bbox_tensor``.
-
-        Args:
-            image_tensor (torch.Tensor): Image tensor of shape (3, H, W) on CPU.
-            bbox_tensor (torch.Tensor): Normalized xywh tensor on CPU.
-
-        Returns:
-            torch.Tensor | None: Cropped tensor or None if the crop is invalid.
-        """
-        _, height, width = image_tensor.shape
-        cx, cy, bw, bh = bbox_tensor.tolist()
-        x1 = max(int(math.floor((cx - bw / 2) * width)), 0)
-        y1 = max(int(math.floor((cy - bh / 2) * height)), 0)
-        x2 = min(int(math.ceil((cx + bw / 2) * width)), width)
-        y2 = min(int(math.ceil((cy + bh / 2) * height)), height)
-
-        if x1 >= width or y1 >= height:
-            return None
-        if x2 <= x1:
-            x2 = min(x1 + 1, width)
-        if y2 <= y1:
-            y2 = min(y1 + 1, height)
-
-        crop = image_tensor[:, y1:y2, x1:x2]
-        if crop.numel() == 0:
-            return None
-        return crop.clone()
-
-    def preprocess_batch(self, batch):
-        """Extend preprocessing to include visual prompt embeddings."""
-        batch = super().preprocess_batch(batch)
-
-        imgs = batch["img"]
-        bboxes = batch.get("bboxes")
-        batch_indices = batch.get("batch_idx")
-        cls_targets = batch.get("cls")
-
-        if bboxes is None or batch_indices is None or cls_targets is None:
-            raise KeyError("Batch must contain 'bboxes', 'batch_idx', and 'cls' for visual prompt training.")
-
-        head = de_parallel(self.model).model[-1]
-        nc = getattr(head, "base_nc", head.nc)
-        embed_dim = getattr(head, "embed_dim", 512)
-        batch_size = imgs.shape[0]
-        num_boxes = bboxes.shape[0]
-        device = self.device
-
-        if num_boxes == 0:
-            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device)
-            batch["visual_feats"] = torch.zeros((batch_size, nc, embed_dim), device=device)
-            batch["visual_mask"] = torch.zeros((batch_size, nc), dtype=torch.bool, device=device)
-            return batch
-
-        per_image_counts = torch.bincount(batch_indices.long().cpu(), minlength=batch_size)
-        max_bbox = int(per_image_counts.max().item())
-        if max_bbox > nc:
-            raise ValueError(f"Detected {max_bbox} visual prompts in a single image, exceeding nc={nc}.")
-
-        image_cache = {}
-        bboxes_cpu = bboxes.cpu()
-        batch_indices_cpu = batch_indices.long().cpu()
-        cls_cpu = cls_targets.view(-1).long().cpu()
-
-        dtype = imgs.dtype
-        visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)
-        visual_feats = torch.zeros((batch_size, nc, embed_dim), device=device, dtype=dtype)
-        class_counts = torch.zeros((batch_size, nc), device=device, dtype=torch.float32)
-
-        crops = []
-        valid_indices = []
-        for idx in range(num_boxes):
-            img_idx = int(batch_indices_cpu[idx].item())
-            if img_idx not in image_cache:
-                image_cache[img_idx] = imgs[img_idx].detach().cpu()
-            crop = self._crop_region(image_cache[img_idx], bboxes_cpu[idx])
-            if crop is None:
-                continue
-            crops.append(crop)
-            valid_indices.append(idx)
-
-        if crops:
-            encoded = self.model.get_visual_pe(crops)
-            encoded = encoded.to(device=device, dtype=imgs.dtype)
-            for embed, idx in zip(encoded, valid_indices):
-                visual_embeds[idx] = embed
-
-        for idx in range(num_boxes):
-            embed = visual_embeds[idx]
-            if not torch.any(embed):
-                continue
-            img_idx = int(batch_indices_cpu[idx].item())
-            cls_id = int(cls_cpu[idx].item())
-            if cls_id < 0 or cls_id >= nc:
-                raise ValueError(f"Class index {cls_id} is out of range for nc={nc}.")
-            visual_feats[img_idx, cls_id] += embed
-            class_counts[img_idx, cls_id] += 1
-
-        valid_mask = class_counts > 0
-        if valid_mask.any():
-            counts = class_counts[valid_mask].unsqueeze(-1).to(dtype=visual_feats.dtype)
-            visual_feats[valid_mask] /= counts
-            visual_feats[valid_mask] = F.normalize(visual_feats[valid_mask], dim=-1, eps=1e-6)
-
-        batch["visual_embeds"] = visual_embeds
-        batch["visual_feats"] = visual_feats
-        batch["visual_mask"] = valid_mask
-        return batch
-
-    def validate(self):
-        """Validate using visual prompts extracted during preprocessing."""
-        metrics = self.validator(self, load_vp=True)
-        if "fitness" in metrics:
-            fitness = float(metrics.pop("fitness"))
-        elif isinstance(self.loss, torch.Tensor):
-            fitness = -float(self.loss.detach().cpu().numpy())
-        else:
-            fitness = 0.0
-        if not self.best_fitness or self.best_fitness < fitness:
-            self.best_fitness = fitness
-        return metrics, fitness
-
-    def final_eval(self):
-        """Run final evaluation with visual prompts."""
-        ckpt = {}
-        for f in self.last, self.best:
-            if f.exists():
-                if f is self.last:
-                    ckpt = strip_optimizer(f)
-                elif f is self.best:
-                    k = "train_results"
-                    strip_optimizer(f, updates={k: ckpt[k]} if k in ckpt else None)
-                    LOGGER.info(f"\nValidating {f}...")
-                    self.validator.args.plots = self.args.plots
-                    self.metrics = self.validator(model=f, load_vp=True)
-                    self.metrics.pop("fitness", None)
-                    self.run_callbacks("on_fit_epoch_end")
 
 
 class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):
@@ -460,3 +241,160 @@ class YOLOTVPTrainerFromScratch(YOLOTVPTrainer, WorldTrainerFromScratch):
         self.validator.args.split = "minival" if isinstance(val, str) and "lvis" in val else "val"
         return super().final_eval()
 
+
+class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
+    """Trainer for learning visual prompts alongside text prompts."""
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        """
+        Initialize the visual prompt trainer.
+
+        Args:
+            cfg (dict): Trainer configuration.
+            overrides (dict, optional): Configuration overrides.
+            _callbacks (list, optional): Callback functions.
+        """
+        if overrides is None:
+            overrides = {}
+        super().__init__(cfg, overrides, _callbacks)
+
+    @staticmethod
+    def _crop_region(image_tensor, bbox_tensor):
+        """
+        Crop a region from ``image_tensor`` using a normalized ``bbox_tensor``.
+
+        Args:
+            image_tensor (torch.Tensor): Image tensor of shape (3, H, W) on CPU.
+            bbox_tensor (torch.Tensor): Normalized xywh tensor on CPU.
+
+        Returns:
+            torch.Tensor | None: Cropped tensor or None if the crop is invalid.
+        """
+        _, height, width = image_tensor.shape
+        cx, cy, bw, bh = bbox_tensor.tolist()
+        x1 = max(int(math.floor((cx - bw / 2) * width)), 0)
+        y1 = max(int(math.floor((cy - bh / 2) * height)), 0)
+        x2 = min(int(math.ceil((cx + bw / 2) * width)), width)
+        y2 = min(int(math.ceil((cy + bh / 2) * height)), height)
+
+        if x1 >= width or y1 >= height:
+            return None
+        if x2 <= x1:
+            x2 = min(x1 + 1, width)
+        if y2 <= y1:
+            y2 = min(y1 + 1, height)
+
+        crop = image_tensor[:, y1:y2, x1:x2]
+        if crop.numel() == 0:
+            return None
+        return crop.clone()
+
+    def preprocess_batch(self, batch):
+        """Extend preprocessing to include visual prompt embeddings."""
+        batch = super().preprocess_batch(batch)
+
+        imgs = batch["img"]
+        bboxes = batch.get("bboxes")
+        batch_indices = batch.get("batch_idx")
+        cls_targets = batch.get("cls")
+
+        if bboxes is None or batch_indices is None or cls_targets is None:
+            raise KeyError("Batch must contain 'bboxes', 'batch_idx', and 'cls' for visual prompt training.")
+
+        model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
+        head = de_parallel(model).model[-1]
+        nc = getattr(head, "base_nc", head.nc)
+        embed_dim = getattr(head, "embed_dim", 512)
+        batch_size = imgs.shape[0]
+        num_boxes = bboxes.shape[0]
+        device = self.device
+
+        if num_boxes == 0:
+            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device)
+            batch["visual_feats"] = torch.zeros((batch_size, nc, embed_dim), device=device)
+            batch["visual_mask"] = torch.zeros((batch_size, nc), dtype=torch.bool, device=device)
+            return batch
+
+        per_image_counts = torch.bincount(batch_indices.long().cpu(), minlength=batch_size)
+        max_bbox = int(per_image_counts.max().item())
+        if max_bbox > nc:
+            raise ValueError(f"Detected {max_bbox} visual prompts in a single image, exceeding nc={nc}.")
+
+        image_cache = {}
+        bboxes_cpu = bboxes.cpu()
+        batch_indices_cpu = batch_indices.long().cpu()
+        cls_cpu = cls_targets.view(-1).long().cpu()
+
+        dtype = imgs.dtype
+        visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)
+        visual_feats = torch.zeros((batch_size, nc, embed_dim), device=device, dtype=dtype)
+        class_counts = torch.zeros((batch_size, nc), device=device, dtype=torch.float32)
+
+        crops = []
+        valid_indices = []
+        for idx in range(num_boxes):
+            img_idx = int(batch_indices_cpu[idx].item())
+            if img_idx not in image_cache:
+                image_cache[img_idx] = imgs[img_idx].detach().cpu()
+            crop = self._crop_region(image_cache[img_idx], bboxes_cpu[idx])
+            if crop is None:
+                continue
+            crops.append(crop)
+            valid_indices.append(idx)
+
+        if crops:
+            encoded = model.get_visual_pe(crops)
+            encoded = encoded.to(device=device, dtype=imgs.dtype)
+            for embed, idx in zip(encoded, valid_indices):
+                visual_embeds[idx] = embed
+
+        for idx in range(num_boxes):
+            embed = visual_embeds[idx]
+            if not torch.any(embed):
+                continue
+            img_idx = int(batch_indices_cpu[idx].item())
+            cls_id = int(cls_cpu[idx].item())
+            if cls_id < 0 or cls_id >= nc:
+                raise ValueError(f"Class index {cls_id} is out of range for nc={nc}.")
+            visual_feats[img_idx, cls_id] += embed
+            class_counts[img_idx, cls_id] += 1
+
+        valid_mask = class_counts > 0
+        if valid_mask.any():
+            counts = class_counts[valid_mask].unsqueeze(-1).to(dtype=visual_feats.dtype)
+            visual_feats[valid_mask] /= counts
+            visual_feats[valid_mask] = F.normalize(visual_feats[valid_mask], dim=-1, eps=1e-6)
+
+        batch["visual_embeds"] = visual_embeds
+        batch["visual_feats"] = visual_feats
+        batch["visual_mask"] = valid_mask
+        return batch
+
+    def validate(self):
+        """Validate using visual prompts extracted during preprocessing."""
+        metrics = self.validator(self, load_vp=True)
+        if "fitness" in metrics:
+            fitness = float(metrics.pop("fitness"))
+        elif isinstance(self.loss, torch.Tensor):
+            fitness = -float(self.loss.detach().cpu().numpy())
+        else:
+            fitness = 0.0
+        if not self.best_fitness or self.best_fitness < fitness:
+            self.best_fitness = fitness
+        return metrics, fitness
+
+    def final_eval(self):
+        """Run final evaluation with visual prompts."""
+        ckpt = {}
+        for f in self.last, self.best:
+            if f.exists():
+                if f is self.last:
+                    ckpt = strip_optimizer(f)
+                elif f is self.best:
+                    k = "train_results"
+                    strip_optimizer(f, updates={k: ckpt[k]} if k in ckpt else None)
+                    LOGGER.info(f"\nValidating {f}...")
+                    self.validator.args.plots = self.args.plots
+                    self.metrics = self.validator(model=f, load_vp=True)
+                    self.metrics.pop("fitness", None)
+                    self.run_callbacks("on_fit_epoch_end")
