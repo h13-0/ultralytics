@@ -315,15 +315,38 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             batch["visual_mask"] = torch.zeros((batch_size, nc), dtype=torch.bool, device=device)
             return batch
 
-        per_image_counts = torch.bincount(batch_indices.long().cpu(), minlength=batch_size)
-        max_bbox = int(per_image_counts.max().item())
-        if max_bbox > nc:
-            raise ValueError(f"Detected {max_bbox} visual prompts in a single image, exceeding nc={nc}.")
-
-        image_cache = {}
+        # 创建 CPU 版本的标注信息
         bboxes_cpu = bboxes.cpu()
         batch_indices_cpu = batch_indices.long().cpu()
         cls_cpu = cls_targets.view(-1).long().cpu()
+
+        # 限制每张图的最大 bbox 数量，不超过 nc，多余的 bbox 直接忽略
+        per_image_counts = torch.bincount(batch_indices_cpu, minlength=batch_size)
+        max_bbox = int(per_image_counts.max().item()) if per_image_counts.numel() else 0
+        if max_bbox > nc:
+            truncated_indices = []
+            for img_idx in range(batch_size):
+                idxs = (batch_indices_cpu == img_idx).nonzero(as_tuple=False).view(-1)
+                if idxs.numel() == 0:
+                    continue
+                truncated_indices.extend(idxs[:nc].tolist())
+            if truncated_indices:
+                truncated_indices = torch.tensor(truncated_indices, dtype=torch.long)
+                bboxes_cpu = bboxes_cpu[truncated_indices]
+                batch_indices_cpu = batch_indices_cpu[truncated_indices]
+                cls_cpu = cls_cpu[truncated_indices]
+                num_boxes = bboxes_cpu.shape[0]
+            else:
+                num_boxes = 0
+            per_image_counts = torch.bincount(batch_indices_cpu, minlength=batch_size)
+
+        if num_boxes == 0:
+            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device)
+            batch["visual_feats"] = torch.zeros((batch_size, nc, embed_dim), device=device)
+            batch["visual_mask"] = torch.zeros((batch_size, nc), dtype=torch.bool, device=device)
+            return batch
+
+        image_cache = {}
 
         dtype = imgs.dtype
         visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)

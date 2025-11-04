@@ -1088,7 +1088,8 @@ class YOLOTVPModel(DetectionModel):
         """
         self.variant = "mobileclip:blt"
         self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
-        self.clip_model = None
+        self.clip_model = None  # legacy attribute retained for compatibility
+        self._clip_cache = None  # avoid registering CLIP models as submodules
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
 
@@ -1120,12 +1121,7 @@ class YOLOTVPModel(DetectionModel):
         from ultralytics.nn.text_model import build_text_model
 
         device = next(self.model.parameters()).device
-        if cache_clip_model:
-            if getattr(self, "clip_model", None) is None:
-                self.clip_model = build_text_model(self.variant, device=device)
-            clip_model = self.clip_model
-        else:
-            clip_model = build_text_model(self.variant, device=device)
+        clip_model = self._get_clip_model(self.variant, device=device, cache=cache_clip_model)
 
         tokens = clip_model.tokenize(text)
         txt_feats = []
@@ -1154,12 +1150,8 @@ class YOLOTVPModel(DetectionModel):
             (torch.Tensor): 视觉提示嵌入。
         """
         if visual is None:
-            from ultralytics.nn.text_model import build_text_model
-
             device = next(self.model.parameters()).device
-            if getattr(self, "clip_model", None) is None:
-                self.clip_model = build_text_model(self.variant, device=device)
-            clip_model = self.clip_model
+            clip_model = self._get_clip_model(self.variant, device=device, cache=True)
 
             processed = clip_model.preprocess_images(img)
             if isinstance(processed, (list, tuple)):
@@ -1173,6 +1165,31 @@ class YOLOTVPModel(DetectionModel):
             return feats.to(dtype=target_dtype, device=device)
 
         return self(img, vpe=visual, return_vpe=True)
+
+    def _get_clip_model(self, variant, device, cache=True):
+        """
+        Build or reuse a CLIP/MobileCLIP model without registering it as a submodule.
+
+        Args:
+            variant (str): CLIP variant string, e.g., "clip:ViT-B/32".
+            device (torch.device): Target device.
+            cache (bool): Whether to store and reuse the model.
+
+        Returns:
+            (TextModel): Multimodal encoder for text/image prompts.
+        """
+        from ultralytics.nn.text_model import build_text_model
+
+        if not cache:
+            return build_text_model(variant, device=device)
+
+        cache_entry = self._clip_cache
+        if cache_entry is None or cache_entry.get("variant") != variant:
+            clip_model = build_text_model(variant, device=device)
+            self._clip_cache = {"variant": variant, "model": clip_model}
+        else:
+            clip_model = cache_entry["model"]
+        return clip_model
 
 
     def predict(self, x, profile=False, visualize=False, txt_feats=None, visuals=None, augment=False, embed=None):
