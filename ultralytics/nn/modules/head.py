@@ -587,7 +587,6 @@ class YOLOTVPDetect(Detect):
         )
 
         self.visual_proj = Residual(SwiGLUFFN(embed, embed))
-        self.savpe = SAVPE(ch, c3, embed)
 
         self.contrast_cls = nn.ModuleList(ContrastiveHead() for _ in ch)
 
@@ -597,69 +596,41 @@ class YOLOTVPDetect(Detect):
         self.prompt_type_mask = None
         self.embed = embed
 
-    def _match_prompt_length(self, tensor, target_len):
-        """Pad or truncate prompt embeddings to the target length."""
-        if tensor.shape[1] == target_len:
-            return tensor
-        if tensor.shape[1] < target_len:
-            pad = torch.zeros(
-                tensor.shape[0],
-                target_len - tensor.shape[1],
-                tensor.shape[2],
-                device=tensor.device,
-                dtype=tensor.dtype,
-            )
-            return torch.cat((tensor, pad), dim=1)
-        return tensor[:, :target_len]
-
     def forward(self, x, text_embed=None, visual_embed=None, return_mask=False):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
-        if text_embed is None and visual_embed is None:
-            raise ValueError("YOLOTVPDetect requires at least one of text_embed or visual_embed.")
-
-        device = x[0].device
-        dtype = x[0].dtype
-        target_len = self.nc
+        # if text_embed is None and visual_embed is None:
+        #     raise ValueError("YOLOTVPDetect requires at least one of text_embed or visual_embed.")
 
         if text_embed is not None:
             if text_embed.ndim != 3:
                 raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embed.shape}.")
-            text_embed = self._match_prompt_length(text_embed.to(device=device, dtype=dtype), target_len)
-        else:
-            text_embed = torch.zeros(x[0].shape[0], target_len, self.embed_dim, device=device, dtype=dtype)
+
+            for i in range(self.nl):
+                embed_cls = self.backbone2embed[i](x[i])
+                contrast_cls = self.contrast_cls[i](embed_cls, text_embed)
+                detect = self.detect[i](x[i])
+                x[i] = torch.cat((detect, contrast_cls), dim=1)
 
         if visual_embed is not None:
-            if visual_embed.ndim == 4:
-                visual_embed = self.savpe(x, visual_embed.to(device=device, dtype=dtype))
-            elif visual_embed.ndim == 3:
-                visual_embed = visual_embed.to(device=device, dtype=dtype)
-            else:
-                raise ValueError(f"Expected visual_embed with 3 or 4 dimensions, but got shape {visual_embed.shape}.")
-            visual_embed = self._match_prompt_length(visual_embed, target_len)
-            visual_mask = visual_embed.abs().sum(-1).gt(0)
+            if visual_embed.ndim != 3:
+                raise ValueError(f"Expected visual_embed with 3 dimensions, but got shape {visual_embed.shape}.")
+
+            param_dtype = next(self.visual_proj.parameters()).dtype
+            visual_embed = visual_embed.to(dtype=param_dtype)
             visual_embed = self.visual_proj(visual_embed)
-        else:
-            visual_embed = torch.zeros_like(text_embed)
-            visual_mask = torch.zeros(text_embed.shape[0], target_len, device=device, dtype=torch.bool)
 
-        for i in range(self.nl):
-            embed_cls = self.backbone2embed[i](x[i])
-            cls_from_text = self.contrast_cls[i](embed_cls, text_embed)
-            cls_from_visual = self.contrast_cls[i](embed_cls, visual_embed)
-            mask = visual_mask[:, :, None, None]
-            contrast_cls = torch.where(mask, cls_from_visual, cls_from_text)
-            detect = self.detect[i](x[i])
-            x[i] = torch.cat((detect, contrast_cls), dim=1)
-
-        self.prompt_type_mask = visual_mask
+            for i in range(self.nl):
+                embed_cls = self.backbone2embed[i](x[i])
+                contrast_cls = self.contrast_cls[i](embed_cls, visual_embed)
+                detect = self.detect[i](x[i])
+                x[i] = torch.cat((detect, contrast_cls), dim=1)
 
         if self.training:
-            return (x, visual_mask) if return_mask else x
+            return x
 
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
         y = self._inference(x)
-        outputs = y if self.export else (y, x)
-        return (outputs, visual_mask) if return_mask else outputs
+        return y if self.export else (y, x)
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""

@@ -1087,13 +1087,14 @@ class YOLOTVPModel(DetectionModel):
             verbose (bool): Whether to display model information.
         """
         self.variant = "mobileclip:blt"
-        self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
+        self.tpe = None #torch.randn(1, nc or 80, 512)  # features placeholder
+        self.vpe = None #torch.randn(1, nc or 80, 512)  # features placeholder
         self.clip_model = None  # legacy attribute retained for compatibility
         self._clip_cache = None  # avoid registering CLIP models as submodules
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
 
-    def set_classes(self, names, embeddings):
+    def set_classes(self, names, tpe, vpe):
         """
         Set classes in advance so that model could do offline-inference without clip model.
 
@@ -1101,7 +1102,8 @@ class YOLOTVPModel(DetectionModel):
             names (List[str]): List of class names.
             embeddings (torch.Tensor): Embeddings tensor.
         """
-        self.txt_feats = embeddings
+        self.tpe = tpe
+        self.vpe = vpe
         self.model[-1].nc = len(names)
         self.names = check_class_names(names)
 
@@ -1190,7 +1192,7 @@ class YOLOTVPModel(DetectionModel):
         return clip_model
 
 
-    def predict(self, x, profile=False, visualize=False, txt_feats=None, visuals=None, augment=False, embed=None):
+    def predict(self, x, profile=False, visualize=False, tpe=None, vpe=None, augment=False, embed=None):
         """
         Perform a forward pass through the model.
 
@@ -1198,26 +1200,24 @@ class YOLOTVPModel(DetectionModel):
             x (torch.Tensor): The input tensor.
             profile (bool): If True, profile the computation time for each layer.
             visualize (bool): If True, save feature maps for visualization.
-            txt_feats (torch.Tensor, optional): The text features, use it if it's given.
-            visuals (torch.Tensor, optional): Visual prompts aligned with the text prompts.
+            tpe (torch.Tensor, optional): The text features, use it if it's given.
+            vpe (torch.Tensor, optional): Visual prompts aligned with the text prompts.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of feature vectors/embeddings to return.
 
         Returns:
             (torch.Tensor): Model's output tensor.
         """
-        txt_feats = (self.txt_feats if txt_feats is None else txt_feats).to(device=x.device, dtype=x.dtype)
-        if len(txt_feats) != len(x) or self.model[-1].export:
-            txt_feats = txt_feats.expand(x.shape[0], -1, -1)
-        ori_txt_feats = txt_feats.clone()
-        visuals_embed = None
-        if visuals is not None:
-            visuals_embed = visuals.to(device=x.device, dtype=x.dtype)
-            if visuals_embed.ndim == 3 and visuals_embed.shape[0] != x.shape[0]:
-                visuals_embed = visuals_embed.expand(x.shape[0], -1, -1)
-            elif visuals_embed.ndim == 4 and visuals_embed.shape[0] != x.shape[0]:
-                visuals_embed = visuals_embed.expand(x.shape[0], -1, -1, -1)
-        ori_visuals = visuals_embed.clone() if visuals_embed is not None else None
+        text_embeds = tpe if tpe is not None else self.tpe
+        ori_text_embeds = None
+        if tpe is not None:
+            text_embeds = tpe.to(device=x.device, dtype=x.dtype)
+            if len(text_embeds) != len(x) or self.model[-1].export:
+                text_embeds = text_embeds.expand(x.shape[0], -1, -1)
+            ori_text_embeds = text_embeds.clone()
+        visual_embeds = vpe if vpe is not None else self.vpe
+        if vpe is not None:
+            visual_embeds = vpe.to(device=x.device, dtype=x.dtype)
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:  # except the head part
             if m.f != -1:  # if not from previous layer
@@ -1225,11 +1225,11 @@ class YOLOTVPModel(DetectionModel):
             if profile:
                 self._profile_one_layer(m, x, dt)
             if isinstance(m, C2fAttn):
-                x = m(x, txt_feats)
+                x = m(x, text_embeds)
             elif isinstance(m, YOLOTVPDetect):
-                x = m(x, ori_txt_feats, ori_visuals)
+                x = m(x, ori_text_embeds, visual_embeds)
             elif isinstance(m, ImagePoolingAttn):
-                txt_feats = m(x, txt_feats)
+                text_embeds = m(x, text_embeds)
             else:
                 x = m(x)  # run
 
@@ -1256,7 +1256,7 @@ class YOLOTVPModel(DetectionModel):
         if preds is None:
             txt_feats = batch.get("txt_feats", batch.get("embeddings"))
             visuals = batch.get("visual_feats", batch.get("visuals"))
-            preds = self.forward(batch["img"], txt_feats=txt_feats, visuals=visuals)
+            preds = self.forward(batch["img"], tpe=txt_feats, vpe=visuals)
         return self.criterion(preds, batch)
 
     def init_criterion(self):

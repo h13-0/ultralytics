@@ -348,7 +348,8 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             valid_indices.append(idx)
 
         if crops:
-            encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
+            # encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
+            encoded = model.get_visual_pe(crops)
             encoded = encoded.to(device=device, dtype=imgs.dtype)
             for embed, idx in zip(encoded, valid_indices):
                 visual_embeds[idx] = embed
@@ -427,7 +428,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                 else build_grounding(self.args, im_path["img_path"], im_path["json_file"], batch, stride=gs)
                 for im_path in img_path
             ]
-            self.set_visual_embeddings(datasets, batch)
+            # self.set_visual_embeddings(datasets, batch)
         else:
             datasets = [build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, multi_modal=True, stride=gs)]
         return YOLOConcatDataset(datasets) if len(datasets) > 1 else datasets[0]

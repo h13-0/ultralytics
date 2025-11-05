@@ -112,7 +112,7 @@ class YOLOTVPValidator(DetectionValidator):
         visual_pe = torch.zeros(len(names), model.model[-1].embed, device=self.device)
 
         cache_path = (
-                Path(dataset.img_path).parent /
+                Path(dataloader.dataset.img_path[0]).parent /
                 f"validset_visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
         if cache_path.exists():
             LOGGER.info(f"Reading existed cache from '{cache_path}'")
@@ -181,11 +181,11 @@ class YOLOTVPValidator(DetectionValidator):
                 self.args.half = False
                 # Directly use the same dataloader for visual embeddings extracted during training
                 vpe = self.get_visual_pe(self.dataloader, model)
-                model.set_classes(names, vpe)
+                model.set_classes(names, tpe=None, vpe=vpe)
             else:
                 LOGGER.info("Validate using the text prompt.")
                 tpe = model.get_text_pe(names)
-                model.set_classes(names, tpe)
+                model.set_classes(names, tpe=tpe, vpe=None)
             stats = super().__call__(trainer, model)
         else:
             if refer_data is not None:
