@@ -1209,7 +1209,7 @@ class YOLOTVPModel(DetectionModel):
             (torch.Tensor): Model's output tensor.
         """
         text_embeds = tpe if tpe is not None else self.tpe
-        ori_text_embeds = None
+        ori_text_embeds = tpe if tpe is not None else self.tpe
         if tpe is not None:
             text_embeds = tpe.to(device=x.device, dtype=x.dtype)
             if len(text_embeds) != len(x) or self.model[-1].export:
