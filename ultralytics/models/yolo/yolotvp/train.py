@@ -1,3 +1,4 @@
+import hashlib
 import itertools
 import math
 from copy import copy
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
-from ultralytics.data import build_dataloader
+from ultralytics.data import build_dataloader, YOLOConcatDataset, build_yolo_dataset, build_grounding
 from .valid import YOLOTVPValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER, TQDM
@@ -347,7 +348,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             valid_indices.append(idx)
 
         if crops:
-            encoded = torch.stack([self.visual_embeddings[crop] for crop in crops], dim=0)
+            encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
             encoded = encoded.to(device=device, dtype=imgs.dtype)
             for embed, idx in zip(encoded, valid_indices):
                 visual_embeds[idx] = embed
@@ -418,9 +419,18 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         Returns:
             (YOLOConcatDataset | Dataset): The constructed dataset for training or validation.
         """
-        datasets = WorldTrainerFromScratch.build_dataset(self, img_path, mode, batch)
-        self.set_visual_embeddings(datasets, batch)
-        return datasets
+        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+        if mode == "train":
+            datasets = [
+                build_yolo_dataset(self.args, im_path, batch, self.training_data[im_path], stride=gs, multi_modal=True)
+                if isinstance(im_path, str)
+                else build_grounding(self.args, im_path["img_path"], im_path["json_file"], batch, stride=gs)
+                for im_path in img_path
+            ]
+            self.set_visual_embeddings(datasets, batch)
+        else:
+            datasets = [build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, multi_modal=True, stride=gs)]
+        return YOLOConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
 
     def get_batch_crops(self, batch):
         """
@@ -448,6 +458,58 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                 crops.append(crop)
         return crops
 
+    def tensor_sha256(self, t, as_hex=True):
+        """
+        Compute a SHA-256 digest for an arbitrary `torch.Tensor`.
+
+        The tensor is normalized to CPU and C-contiguous layout and hashed via a zero-copy byte view.
+        Optionally includes dtype/shape metadata to avoid collisions between identical byte buffers
+        interpreted with different views.
+
+        Args:
+            t (torch.Tensor): Tensor to hash.
+            include_meta (bool, optional): If True, include dtype, shape, and layout metadata in the
+                digest to disambiguate views. Defaults to True.
+            as_hex (bool, optional): If True, return a hex string; if False, return the raw 32-byte
+                digest. Defaults to True.
+
+        Returns:
+            str | bytes: The SHA-256 digest in hex (default) or raw bytes.
+
+        Raises:
+            TypeError: If `t` is not a `torch.Tensor`.
+
+        Notes:
+            - GPU tensors are copied to CPU before hashing.
+            - The tensor is detached to avoid holding autograd graph references.
+
+        Example:
+            >>> import torch
+            >>> d = tensor_sha256(torch.zeros(3, 224, 224, dtype=torch.uint8))
+            >>> len(d), isinstance(d, str)
+            (64, True)
+        """
+        if not torch.is_tensor(t):
+            raise TypeError(f"tensor_sha256 expects a torch.Tensor, got: {type(t)}")
+
+        # Detach from autograd and normalize device/layout
+        x = t.detach()
+        if x.device.type != "cpu":
+            x = x.cpu()  # GPU -> CPU transfer
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        # Share underlying storage with NumPy (contiguous ensured) to avoid extra copies
+        arr = x.numpy()  # type: ignore[arg-type]
+
+        h = hashlib.sha256()
+
+        # Zero-copy byte view of tensor data
+        h.update(memoryview(arr).cast("B"))
+
+        digest = h.digest()
+        return digest.hex() if as_hex else digest
+
     def set_visual_embeddings(self, datasets, batch_size):
         """
         Set visual embeddings for datasets to accelerate training by caching category names.
@@ -469,33 +531,35 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
         assert model is not None
 
-        for dataset in datasets.datasets:
+        for dataset in datasets:
             visual_map = {}
             cache_path = (
                     Path(dataset.img_path).parent /
-                    f"visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
+                    f"trainset_visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
             if cache_path.exists():
                 LOGGER.info(f"Reading existed cache from '{cache_path}'")
                 visual_map = torch.load(cache_path)
+            else:
+                dataloader = build_dataloader(
+                    dataset=dataset,
+                    batch=batch_size,
+                    workers=4,
+                    shuffle=True,
+                    rank=-1,
+                )
+                pbar = TQDM(dataloader, total=len(dataloader), desc=desc)
+                for batch in pbar:
+                    crops = self.get_batch_crops(batch)
+                    miss_crops = [crop for crop in crops if self.tensor_sha256(crop) not in visual_map]
+                    if miss_crops:
+                        feats = model.get_visual_pe(miss_crops)
+                        crop_hash = [self.tensor_sha256(crop) for crop in miss_crops]
+                        visual_map.update(zip(crop_hash, feats.squeeze(0)))
 
-            dataloader = build_dataloader(
-                dataset=dataset,
-                batch=batch_size,
-                workers=4,
-                shuffle=True,
-                rank=-1,
-            )
-            pbar = TQDM(dataloader, total=len(dataloader), desc=desc)
-            for batch in pbar:
-                crops = self.get_batch_crops(batch)
+                LOGGER.info(f"Caching text embeddings to '{cache_path}'")
+                torch.save(visual_map, cache_path)
 
-                miss_crops = [crop for crop in crops if crop not in visual_map]
-                if miss_crops:
-                    feats = model.get_visual_pe(miss_crops)
-                    visual_map.update(zip(miss_crops, feats.squeeze(0)))
+            visual_map = {k: v.detach().cpu() for k, v in visual_map.items()}
+            visual_embeddings.update(visual_map)
 
-                visual_embeddings.update(visual_map)
-
-            LOGGER.info(f"Caching text embeddings to '{cache_path}'")
-            torch.save(visual_map, cache_path)
         self.visual_embeddings = visual_embeddings

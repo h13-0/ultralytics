@@ -1,8 +1,11 @@
 import math
 from copy import deepcopy
+from pathlib import Path
 
 import torch
 from torch.nn import functional as F
+
+from ultralytics.data import dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.tasks import YOLOTVPModel
@@ -107,6 +110,15 @@ class YOLOTVPValidator(DetectionValidator):
         assert isinstance(model, YOLOTVPModel)
         names = [name.split("/", 1)[0] for name in list(dataloader.dataset.data["names"].values())]
         visual_pe = torch.zeros(len(names), model.model[-1].embed, device=self.device)
+
+        cache_path = (
+                Path(dataset.img_path).parent /
+                f"validset_visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
+        if cache_path.exists():
+            LOGGER.info(f"Reading existed cache from '{cache_path}'")
+            visual_pe = torch.load(cache_path).to(self.device)
+            return visual_pe
+
         cls_visual_num = torch.zeros(len(names))
 
         desc = "Get visual prompt embeddings from samples"
@@ -136,7 +148,9 @@ class YOLOTVPValidator(DetectionValidator):
         # Normalize embeddings for classes with samples, set others to zero
         visual_pe[cls_visual_num != 0] = F.normalize(visual_pe[cls_visual_num != 0], dim=-1, p=2)
         visual_pe[cls_visual_num == 0] = 0
-        return visual_pe.unsqueeze(0)
+        visual_pe = visual_pe.unsqueeze(0)
+        torch.save(visual_pe, cache_path)
+        return visual_pe
 
 
     @smart_inference_mode()
