@@ -360,6 +360,98 @@ class MobileCLIP(TextModel):
         return feats
 
 
+class SiliconFlowEmbed(TextModel):
+    """
+    Text encoder backed by SiliconFlow's hosted BGE models.
+
+    This encoder forwards text inputs to SiliconFlow's embedding API and returns normalized torch tensors so they can
+    be consumed like locally hosted models.
+    """
+
+    def __init__(self, model_name, api_token, device=None, api_url="https://api.siliconflow.cn/v1/embeddings"):
+        """
+        Initialize a SiliconFlow BGE encoder.
+
+        Args:
+            model_name (str): Remote model identifier, e.g. ``"BAAI/bge-large-zh-v1.5"``.
+            api_token (str): SiliconFlow API token used for authentication.
+            device (torch.device | str | None): Target device for returning embeddings. Defaults to CPU.
+            api_url (str): Embedding endpoint URL.
+        """
+        try:
+            import requests
+        except ImportError:  # pragma: no cover - handled via runtime dependency check
+            checks.check_requirements("requests")
+            import requests
+
+        super().__init__()
+        self.model_name = model_name
+        self.api_token = api_token
+        self.api_url = api_url
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+
+    def tokenize(self, texts):
+        """
+        BGE cloud models accept raw strings, so tokenization is a pass-through.
+
+        Args:
+            texts (Any): Input text(s).
+
+        Returns:
+            Any: Same value that was provided.
+        """
+        return texts
+
+    @smart_inference_mode()
+    def encode_text(self, texts, dtype=torch.float32):
+        """
+        Request SiliconFlow embeddings for the provided texts.
+
+        Args:
+            texts (str | Sequence[str]): Text inputs (raw strings).
+            dtype (torch.dtype): Desired dtype for the resulting tensor.
+
+        Returns:
+            torch.Tensor: L2-normalized embeddings shaped (batch, dim).
+        """
+        import requests
+        if isinstance(texts, str):
+            inputs = [texts]
+        elif isinstance(texts, (list, tuple)):
+            inputs = list(texts)
+        else:
+            try:
+                inputs = list(texts)
+            except TypeError as exc:
+                raise TypeError("SiliconFlowBGE.encode_text expects a string or sequence of strings.") from exc
+
+        if not inputs or not all(isinstance(item, str) for item in inputs):
+            raise TypeError("SiliconFlowBGE.encode_text expects non-empty string inputs.")
+
+        payload = {"model": self.model_name, "input": inputs if len(inputs) > 1 else inputs[0]}
+        headers = {"Authorization": f"Bearer {self.api_token}", "Content-Type": "application/json"}
+
+        try:
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            body = response.json()
+        except requests.RequestException as exc:  # pragma: no cover - network failures depend on runtime
+            raise RuntimeError("Failed to fetch embeddings from SiliconFlow.") from exc
+
+        data = body.get("data") if isinstance(body, dict) else None
+        if not data:
+            raise RuntimeError("SiliconFlow response did not contain any embeddings.")
+
+        embeddings = [item.get("embedding") for item in data if isinstance(item, dict)]
+        if len(embeddings) != len(inputs) or any(embedding is None for embedding in embeddings):
+            raise RuntimeError("SiliconFlow response is missing embedding vectors.")
+
+        features = torch.tensor(embeddings, dtype=dtype)
+        features = features.to(self.device)
+        norms = features.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-12)
+        return features / norms
+
+
 class MobileCLIPTS(TextModel):
     """
     Load a TorchScript traced version of MobileCLIP.
@@ -459,11 +551,23 @@ def build_text_model(variant, device=None):
     Examples:
         >>> model = build_text_model("clip:ViT-B/32", device=torch.device("cuda"))
         >>> model = build_text_model("mobileclip:s0", device=torch.device("cpu"))
+        >>> model = build_text_model("siliconflow:BAAI/bge-large-zh-v1.5@<token>")
     """
-    base, size = variant.split(":")
+    base, size = variant.split(":", 1)
     if base == "clip":
         return CLIP(size, device)
     elif base == "mobileclip":
         return MobileCLIP(size, device)
+    elif base == "siliconflow":
+        if "@" not in size:
+            raise ValueError("SiliconFlow variants must be formatted as 'siliconflow:model@token'.")
+        model_name, api_token = size.split("@", 1)
+        model_name = model_name.strip()
+        api_token = api_token.strip()
+        if not model_name or not api_token:
+            raise ValueError("Both model name and token are required for SiliconFlow variants.")
+        return SiliconFlowEmbed(model_name, api_token, device=device)
     else:
-        raise ValueError(f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip'.")
+        raise ValueError(
+            f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip', 'siliconflow'."
+        )
