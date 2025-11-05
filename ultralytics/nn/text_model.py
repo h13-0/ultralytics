@@ -6,6 +6,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.utils import checks
 from ultralytics.utils.torch_utils import smart_inference_mode
@@ -452,10 +453,9 @@ class SiliconFlowEmbed(TextModel):
         if len(embeddings) != len(inputs) or any(embedding is None for embedding in embeddings):
             raise RuntimeError("SiliconFlow response is missing embedding vectors.")
 
-        features = torch.tensor(embeddings, dtype=dtype)
-        features = features.to(self.device)
-        norms = features.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-12)
-        return features / norms
+        features = torch.tensor(embeddings, dtype=dtype, device=self.device)
+        normalized = F.normalize(features, p=2, dim=-1)
+        return normalized.clone()
 
 
 class MobileCLIPTS(TextModel):
