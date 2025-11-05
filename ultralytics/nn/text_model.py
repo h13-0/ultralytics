@@ -2,6 +2,7 @@
 
 from abc import abstractmethod
 from pathlib import Path
+import time
 
 import torch
 import torch.nn as nn
@@ -423,20 +424,25 @@ class SiliconFlowEmbed(TextModel):
             try:
                 inputs = list(texts)
             except TypeError as exc:
-                raise TypeError("SiliconFlowBGE.encode_text expects a string or sequence of strings.") from exc
+                raise TypeError("SiliconFlowEmbed.encode_text expects a string or sequence of strings.") from exc
 
         if not inputs or not all(isinstance(item, str) for item in inputs):
-            raise TypeError("SiliconFlowBGE.encode_text expects non-empty string inputs.")
+            raise TypeError("SiliconFlowEmbed.encode_text expects non-empty string inputs.")
 
         payload = {"model": self.model_name, "input": inputs if len(inputs) > 1 else inputs[0]}
         headers = {"Authorization": f"Bearer {self.api_token}", "Content-Type": "application/json"}
 
-        try:
-            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
-            response.raise_for_status()
-            body = response.json()
-        except requests.RequestException as exc:  # pragma: no cover - network failures depend on runtime
-            raise RuntimeError("Failed to fetch embeddings from SiliconFlow.") from exc
+        body = None
+        for attempt in range(3):
+            try:
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+                response.raise_for_status()
+                body = response.json()
+                break
+            except requests.RequestException as exc:  # pragma: no cover - network failures depend on runtime
+                if attempt == 2:
+                    raise RuntimeError("Failed to fetch embeddings from SiliconFlow.") from exc
+                time.sleep(1.5 * (attempt + 1))
 
         data = body.get("data") if isinstance(body, dict) else None
         if not data:
