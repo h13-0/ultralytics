@@ -102,7 +102,7 @@ class YOLOTVPTrainer(WorldTrainer):
 
     def preprocess_batch(self, batch):
         """Preprocess a batch of images and (optional) text prompts for YOLOTVP training."""
-        batch = DetectionTrainer.preprocess_batch(self, batch)
+        batch = super().preprocess_batch(batch)
 
         if not getattr(self, "text_embeddings", None):
             return batch

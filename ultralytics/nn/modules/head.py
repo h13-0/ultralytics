@@ -604,6 +604,7 @@ class YOLOTVPDetect(Detect):
         if text_embed is not None:
             if text_embed.ndim != 3:
                 raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embed.shape}.")
+            text_embed = text_embed.to(dtype=next(self.contrast_cls[0].parameters()).dtype)
 
             for i in range(self.nl):
                 embed_cls = self.backbone2embed[i](x[i])
@@ -614,9 +615,7 @@ class YOLOTVPDetect(Detect):
         if visual_embed is not None:
             if visual_embed.ndim != 3:
                 raise ValueError(f"Expected visual_embed with 3 dimensions, but got shape {visual_embed.shape}.")
-
-            param_dtype = next(self.visual_proj.parameters()).dtype
-            visual_embed = visual_embed.to(dtype=param_dtype)
+            visual_embed = visual_embed.to(dtype=next(self.visual_proj.parameters()).dtype)
             visual_embed = self.visual_proj(visual_embed)
 
             for i in range(self.nl):
