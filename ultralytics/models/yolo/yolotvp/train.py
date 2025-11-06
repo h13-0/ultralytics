@@ -275,73 +275,38 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
     def preprocess_batch(self, batch):
         """Extend preprocessing to include visual prompt embeddings."""
         batch = DetectionTrainer.preprocess_batch(self, batch)
-
-        imgs = batch["img"]
-        bboxes = batch.get("bboxes")
-        batch_indices = batch.get("batch_idx")
-        cls_targets = batch.get("cls")
-
-        if bboxes is None or batch_indices is None or cls_targets is None:
-            raise KeyError("Batch must contain 'bboxes', 'batch_idx', and 'cls' for visual prompt training.")
-
-        model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
-        head = de_parallel(model).model[-1]
-        embed_dim = getattr(head, "embed_dim", 512)
-        batch_size = imgs.shape[0]
-        num_boxes = bboxes.shape[0]
-        device = self.device
-        dtype = imgs.dtype
-
-        # 创建 CPU 版本的标注信息
-        bboxes_cpu = bboxes.cpu()
-        batch_indices_cpu = batch_indices.long().cpu()
-
-        per_image_counts = torch.bincount(batch_indices_cpu, minlength=batch_size)
-        max_bboxes = int(per_image_counts.max().item()) if per_image_counts.numel() else 0
-        head.nc = max_bboxes
-
-        if num_boxes == 0:
-            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device, dtype=dtype)
-            batch["visual_feats"] = torch.zeros(
-                (batch_size, max_bboxes, embed_dim), device=device, dtype=dtype
+        texts = list(itertools.chain(*batch["texts"]))
+        visual_map = getattr(self, "visual_embeddings", None) or {}
+        aggregated = []
+        eps = 1e-6
+        for text in texts:
+            embed = None
+            pool = visual_map.get(text) if isinstance(visual_map, dict) else None
+            if isinstance(pool, torch.Tensor) and pool.ndim == 2 and pool.shape[0] > 0:
+                pool = pool.to(self.device)
+                num_samples = pool.shape[0]
+                sample_count = max(1, num_samples // 2)
+                indices = torch.randperm(num_samples, device=pool.device)[:sample_count]
+                sampled = pool[indices]
+                mean_embed = sampled.mean(dim=0)
+                norm = mean_embed.norm(p=2)
+                if norm > eps:
+                    mean_embed = mean_embed / norm
+                embed = mean_embed
+            if embed is None:
+                # fallback to text embeddings
+                embed = self.text_embeddings[text].to(self.device)
+                embed = embed / (embed.norm(p=2) + eps)
+            aggregated.append(embed)
+        if aggregated:
+            emb_tensor = torch.stack(aggregated, dim=0)
+            emb_tensor = emb_tensor.reshape(len(batch["texts"]), -1, emb_tensor.shape[-1])
+            batch["visual_feats"] = emb_tensor
+        else:
+            batch["visual_feats"] = torch.empty(
+                (len(batch["texts"]), 0, next(iter(self.text_embeddings.values())).shape[-1]),
+                device=self.device,
             )
-            batch["visual_mask"] = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
-            return batch
-
-        image_cache = {}
-        visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)
-        crops = []
-        valid_indices = []
-        for idx in range(num_boxes):
-            img_idx = int(batch_indices_cpu[idx].item())
-            if img_idx not in image_cache:
-                image_cache[img_idx] = imgs[img_idx].detach().cpu()
-            crop = self._crop_region(image_cache[img_idx], bboxes_cpu[idx])
-            if crop is None:
-                continue
-            crops.append(crop)
-            valid_indices.append(idx)
-
-        if crops:
-            # encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
-            encoded = model.get_visual_pe(crops)
-            encoded = encoded.to(device=device, dtype=dtype)
-            for embed, idx in zip(encoded, valid_indices):
-                visual_embeds[idx] = embed
-
-        visual_feats = torch.zeros((batch_size, max_bboxes, embed_dim), device=device, dtype=dtype)
-        visual_mask = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
-        positions = [0] * batch_size
-        for idx in range(num_boxes):
-            img_idx = int(batch_indices_cpu[idx].item())
-            col = positions[img_idx]
-            if col >= max_bboxes:
-                continue
-            visual_feats[img_idx, col] = visual_embeds[idx]
-            positions[img_idx] += 1
-            visual_mask[img_idx, col] = True
-
-        batch["visual_feats"] = visual_feats
         return batch
 
     def validate(self):
@@ -396,88 +361,54 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                 else build_grounding(self.args, im_path["img_path"], im_path["json_file"], batch, stride=gs)
                 for im_path in img_path
             ]
-            # self.set_visual_embeddings(datasets, batch)
+            self.set_text_embeddings(datasets, batch)
+            self.set_visual_embeddings(datasets, batch)
         else:
             datasets = [build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, multi_modal=True, stride=gs)]
         return YOLOConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
 
-    def get_batch_crops(self, batch):
+    def get_batch_crops(self, batch, return_cls=False):
         """
         Extract cropped image patches for all bounding boxes in the batch.
         Args:
             batch (dict): Batch dictionary containing keys 'img', 'bboxes', and 'batch_idx'.
+            return_cls (bool): If True, also return class indices aligned with the crops.
         Returns:
-            List[torch.Tensor]: List of cropped image tensors (each in CHW format on CPU).
+            List[torch.Tensor] | Tuple[List[torch.Tensor], List[int]]:
+                Cropped image tensors (each in CHW format on CPU), optionally with class indices.
         """
         imgs = batch["img"]
         bboxes = batch.get("bboxes")
         batch_indices = batch.get("batch_idx")
+        cls_targets = batch.get("cls") if return_cls else None
         if bboxes is None or batch_indices is None:
             raise KeyError("Batch must contain 'bboxes' and 'batch_idx' to extract crops.")
         bboxes_cpu = bboxes.cpu()
         batch_indices_cpu = batch_indices.long().cpu()
+        if return_cls:
+            if cls_targets is None:
+                raise KeyError("Batch must contain 'cls' to return class indices alongside crops.")
+            cls_cpu = cls_targets.view(-1).long().cpu()
         image_cache = {}
         crops = []
-        for bbox, img_idx_tensor in zip(bboxes_cpu, batch_indices_cpu):
+        classes = [] if return_cls else None
+        iterator = zip(bboxes_cpu, batch_indices_cpu, cls_cpu) if return_cls else zip(bboxes_cpu, batch_indices_cpu)
+        for items in iterator:
+            if return_cls:
+                bbox, img_idx_tensor, cls_idx = items
+            else:
+                bbox, img_idx_tensor = items
             img_idx = int(img_idx_tensor.item())
             if img_idx not in image_cache:
                 image_cache[img_idx] = imgs[img_idx].detach().cpu()
             crop = self._crop_region(image_cache[img_idx], bbox)
             if crop is not None:
                 crops.append(crop)
+                if return_cls:
+                    classes.append(int(cls_idx.item()))
+        if return_cls:
+            return crops, classes
         return crops
-
-    def tensor_sha256(self, t, as_hex=True):
-        """
-        Compute a SHA-256 digest for an arbitrary `torch.Tensor`.
-
-        The tensor is normalized to CPU and C-contiguous layout and hashed via a zero-copy byte view.
-        Optionally includes dtype/shape metadata to avoid collisions between identical byte buffers
-        interpreted with different views.
-
-        Args:
-            t (torch.Tensor): Tensor to hash.
-            include_meta (bool, optional): If True, include dtype, shape, and layout metadata in the
-                digest to disambiguate views. Defaults to True.
-            as_hex (bool, optional): If True, return a hex string; if False, return the raw 32-byte
-                digest. Defaults to True.
-
-        Returns:
-            str | bytes: The SHA-256 digest in hex (default) or raw bytes.
-
-        Raises:
-            TypeError: If `t` is not a `torch.Tensor`.
-
-        Notes:
-            - GPU tensors are copied to CPU before hashing.
-            - The tensor is detached to avoid holding autograd graph references.
-
-        Example:
-            >>> import torch
-            >>> d = tensor_sha256(torch.zeros(3, 224, 224, dtype=torch.uint8))
-            >>> len(d), isinstance(d, str)
-            (64, True)
-        """
-        if not torch.is_tensor(t):
-            raise TypeError(f"tensor_sha256 expects a torch.Tensor, got: {type(t)}")
-
-        # Detach from autograd and normalize device/layout
-        x = t.detach()
-        if x.device.type != "cpu":
-            x = x.cpu()  # GPU -> CPU transfer
-        if not x.is_contiguous():
-            x = x.contiguous()
-
-        # Share underlying storage with NumPy (contiguous ensured) to avoid extra copies
-        arr = x.numpy()  # type: ignore[arg-type]
-
-        h = hashlib.sha256()
-
-        # Zero-copy byte view of tensor data
-        h.update(memoryview(arr).cast("B"))
-
-        digest = h.digest()
-        return digest.hex() if as_hex else digest
 
     def set_visual_embeddings(self, datasets, batch_size):
         """
@@ -489,26 +420,31 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         Args:
             datasets (List[Dataset]): List of datasets from which to extract category names.
             batch_size (int | None): Batch size used for processing.
-
         Notes:
             This method collects category names from datasets that have the 'category_names' attribute,
             then uses the first dataset's image path to determine where to cache the generated text embeddings.
         """
         visual_embeddings = {}
         desc = "Obtain and cache the image embeddings"
-
         model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
         assert model is not None
-
         for dataset in datasets:
-            visual_map = {}
+            names = getattr(dataset, "names", None)
+            if names is None and hasattr(dataset, "data"):
+                names = dataset.data.get("names", None)
             cache_path = (
                     Path(dataset.img_path).parent /
                     f"trainset_visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
+            visual_map = {}
+            cache_loaded = False
             if cache_path.exists():
                 LOGGER.info(f"Reading existed cache from '{cache_path}'")
                 visual_map = torch.load(cache_path)
-            else:
+                if isinstance(visual_map, dict) and all(isinstance(v, torch.Tensor) and v.ndim == 2 for v in visual_map.values()):
+                    cache_loaded = True
+                else:
+                    LOGGER.warning("Cached visual embeddings are in an unexpected format. Rebuilding cache.")
+            if not cache_loaded:
                 dataloader = build_dataloader(
                     dataset=dataset,
                     batch=batch_size,
@@ -518,17 +454,30 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
                 )
                 pbar = TQDM(dataloader, total=len(dataloader), desc=desc)
                 for batch in pbar:
-                    crops = self.get_batch_crops(batch)
-                    miss_crops = [crop for crop in crops if self.tensor_sha256(crop) not in visual_map]
-                    if miss_crops:
-                        feats = model.get_visual_pe(miss_crops)
-                        crop_hash = [self.tensor_sha256(crop) for crop in miss_crops]
-                        visual_map.update(zip(crop_hash, feats.squeeze(0)))
-
+                    crops, cls_indices = self.get_batch_crops(batch, return_cls=True)
+                    if not crops:
+                        continue
+                    feats = model.get_visual_pe(crops).squeeze(0)
+                    if feats.ndim == 1:
+                        feats = feats.unsqueeze(0)
+                    for feat, cls_idx in zip(feats, cls_indices):
+                        cls_idx = int(cls_idx)
+                        if isinstance(names, dict):
+                            class_name = names.get(cls_idx, str(cls_idx))
+                        elif isinstance(names, (list, tuple)):
+                            class_name = names[cls_idx] if 0 <= cls_idx < len(names) else str(cls_idx)
+                        else:
+                            class_name = str(cls_idx)
+                        visual_map.setdefault(class_name, []).append(feat.detach().cpu())
                 LOGGER.info(f"Caching text embeddings to '{cache_path}'")
-                torch.save(visual_map, cache_path)
-
-            visual_map = {k: v.detach().cpu() for k, v in visual_map.items()}
-            visual_embeddings.update(visual_map)
-
+                stacked_map = {k: torch.stack(v, dim=0) for k, v in visual_map.items() if len(v)}
+                torch.save(stacked_map, cache_path)
+                visual_map = stacked_map
+            else:
+                visual_map = {k: v.detach().cpu() for k, v in visual_map.items()}
+            for class_name, embeds in visual_map.items():
+                if class_name in visual_embeddings:
+                    visual_embeddings[class_name] = torch.cat((visual_embeddings[class_name], embeds), dim=0)
+                else:
+                    visual_embeddings[class_name] = embeds
         self.visual_embeddings = visual_embeddings

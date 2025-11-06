@@ -4,13 +4,11 @@ from pathlib import Path
 
 import torch
 from torch.nn import functional as F
-
-from ultralytics.data import dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import LOGGER, TQDM
-from ultralytics.utils.torch_utils import smart_inference_mode, select_device, de_parallel
+from ultralytics.utils.torch_utils import smart_inference_mode, select_device
 
 
 class YOLOTVPValidator(DetectionValidator):
@@ -26,6 +24,10 @@ class YOLOTVPValidator(DetectionValidator):
         args (namespace): Configuration arguments for validation.
         dataloader (DataLoader): DataLoader for validation data.
     """
+    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
+        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+        self.visual_embeddings = None
+
 
     @staticmethod
     def _crop_region(image_tensor, bbox_tensor):
@@ -59,44 +61,20 @@ class YOLOTVPValidator(DetectionValidator):
         return crop.clone()
 
     def preprocess(self, batch):
-        """Extend preprocessing to include visual prompt embeddings."""
+        """Preprocess batch data, ensuring visuals are on the same device as images."""
         batch = super().preprocess(batch)
+        if "visuals" in batch:
+            batch["visuals"] = batch["visuals"].to(batch["img"].device)
+
         imgs = batch["img"]
         bboxes = batch.get("bboxes")
         batch_indices = batch.get("batch_idx")
-        cls_targets = batch.get("cls")
-
-        if bboxes is None or batch_indices is None or cls_targets is None:
-            raise KeyError("Batch must contain 'bboxes', 'batch_idx', and 'cls' for visual prompt training.")
-
-        model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
-        head = de_parallel(model).model[-1]
-        embed_dim = getattr(head, "embed_dim", 512)
-        batch_size = imgs.shape[0]
         num_boxes = bboxes.shape[0]
-        device = self.device
-        dtype = imgs.dtype
-
-        # 创建 CPU 版本的标注信息
+        image_cache = {}
         bboxes_cpu = bboxes.cpu()
         batch_indices_cpu = batch_indices.long().cpu()
 
-        per_image_counts = torch.bincount(batch_indices_cpu, minlength=batch_size)
-        max_bboxes = int(per_image_counts.max().item()) if per_image_counts.numel() else 0
-        head.nc = max_bboxes
-
-        if num_boxes == 0:
-            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device, dtype=dtype)
-            batch["visual_feats"] = torch.zeros(
-                (batch_size, max_bboxes, embed_dim), device=device, dtype=dtype
-            )
-            batch["visual_mask"] = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
-            return batch
-
-        image_cache = {}
-        visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)
         crops = []
-        valid_indices = []
         for idx in range(num_boxes):
             img_idx = int(batch_indices_cpu[idx].item())
             if img_idx not in image_cache:
@@ -105,29 +83,70 @@ class YOLOTVPValidator(DetectionValidator):
             if crop is None:
                 continue
             crops.append(crop)
-            valid_indices.append(idx)
-
-        if crops:
-            # encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
-            encoded = model.get_visual_pe(crops)
-            encoded = encoded.to(device=device, dtype=dtype)
-            for embed, idx in zip(encoded, valid_indices):
-                visual_embeds[idx] = embed
-
-        visual_feats = torch.zeros((batch_size, max_bboxes, embed_dim), device=device, dtype=dtype)
-        visual_mask = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
-        positions = [0] * batch_size
-        for idx in range(num_boxes):
-            img_idx = int(batch_indices_cpu[idx].item())
-            col = positions[img_idx]
-            if col >= max_bboxes:
-                continue
-            visual_feats[img_idx, col] = visual_embeds[idx]
-            positions[img_idx] += 1
-            visual_mask[img_idx, col] = True
-
-        batch["visual_feats"] = visual_feats
+        batch["visual_feats"] = self.visual_embeddings.to(batch["img"].device)
         return batch
+
+    @smart_inference_mode()
+    def get_visual_pe(self, dataloader, model):
+        """
+        Extract visual prompt embeddings from training samples.
+
+        This function processes a dataloader to compute visual prompt embeddings for each class
+        using a YOLOE model. It normalizes the embeddings and handles cases where no samples
+        exist for a class.
+
+        Args:
+            dataloader (torch.utils.data.DataLoader): The dataloader providing training samples.
+            model (YOLOTVPModel): The YOLOTVP model from which to extract visual prompt embeddings.
+
+        Returns:
+            (torch.Tensor): Visual prompt embeddings with shape (1, num_classes, embed_dim).
+        """
+        assert isinstance(model, YOLOTVPModel)
+        names = [name.split("/", 1)[0] for name in list(dataloader.dataset.data["names"].values())]
+        visual_pe = torch.zeros(len(names), model.model[-1].embed, device=self.device)
+
+        cache_path = (
+                Path(dataloader.dataset.img_path[0]).parent /
+                f"validset_visual_embeddings_{model.variant.replace(':', '_').replace('/', '_')}.pt")
+        if cache_path.exists():
+            LOGGER.info(f"Reading existed cache from '{cache_path}'")
+            visual_pe = torch.load(cache_path).to(self.device)
+            self.visual_embeddings = visual_pe
+            return visual_pe
+
+        cls_visual_num = torch.zeros(len(names))
+
+        desc = "Get visual prompt embeddings from samples"
+
+        # Count samples per class
+        for batch in dataloader:
+            cls = batch["cls"].squeeze(-1).to(torch.int).unique()
+            count = torch.bincount(cls, minlength=len(names))
+            cls_visual_num += count
+
+        cls_visual_num = cls_visual_num.to(self.device)
+
+        # Extract visual prompt embeddings
+        pbar = TQDM(dataloader, total=len(dataloader), desc=desc)
+        for batch in pbar:
+            batch = self.preprocess(batch)
+            preds = model.get_visual_pe(batch["crops"])  # (B, max_n, embed_dim)
+
+            batch_idx = batch["batch_idx"]
+            for i in range(preds.shape[0]):
+                cls = batch["cls"][batch_idx == i].squeeze(-1).to(torch.int).unique(sorted=True)
+                pad_cls = torch.ones(preds.shape[1], device=self.device) * -1
+                pad_cls[: cls.shape[0]] = cls
+                for c in cls:
+                    visual_pe[c] += preds[i][pad_cls == c].sum(0) / cls_visual_num[c]
+
+        # Normalize embeddings for classes with samples, set others to zero
+        visual_pe[cls_visual_num != 0] = F.normalize(visual_pe[cls_visual_num != 0], dim=-1, p=2)
+        visual_pe[cls_visual_num == 0] = 0
+        visual_pe = visual_pe.unsqueeze(0)
+        self.visual_embeddings = visual_pe
+        return visual_pe
 
 
     @smart_inference_mode()
@@ -148,42 +167,19 @@ class YOLOTVPValidator(DetectionValidator):
         Returns:
             (dict): Validation statistics containing metrics computed during validation.
         """
-        if trainer is not None:
-            self.device = trainer.device
-            model = trainer.ema.ema
-            names = [name.split("/", 1)[0] for name in list(self.dataloader.dataset.data["names"].values())]
+        self.device = trainer.device
+        model = trainer.ema.ema
+        names = [name.split("/", 1)[0] for name in list(self.dataloader.dataset.data["names"].values())]
 
-            if load_vp:
-                LOGGER.info("Validate using the visual prompt.")
-                self.args.half = False
-            else:
-                LOGGER.info("Validate using the text prompt.")
-            stats = super().__call__(trainer, model)
+        if load_vp:
+            LOGGER.info("Validate using the visual prompt.")
+            self.args.half = False
+            # Directly use the same dataloader for visual embeddings extracted during training
+            vpe = self.get_visual_pe(self.dataloader, model)
+            model.set_classes(names, tpe=None, vpe=vpe)
         else:
-            if refer_data is not None:
-                assert load_vp, "Refer data is only used for visual prompt validation."
-            self.device = select_device(self.args.device)
-
-            if isinstance(model, str):
-                from ultralytics.nn.tasks import attempt_load_weights
-
-                model = attempt_load_weights(model, device=self.device, inplace=True)
-            model.eval().to(self.device)
-            data = check_det_dataset(refer_data or self.args.data)
-            names = [name.split("/", 1)[0] for name in list(data["names"].values())]
-
-            if load_vp:
-                LOGGER.info("Validate using the visual prompt.")
-                self.args.half = False
-                # TODO: need to check if the names from refer data is consistent with the evaluated dataset
-                # could use same dataset or refer to extract visual prompt embeddings
-                dataloader = self.get_vpe_dataloader(data)
-                vpe = model.get_visual_pe(dataloader, model)
-                model.set_classes(names, vpe)
-                stats = super().__call__(model=deepcopy(model))
-            else:
-                LOGGER.info("Validate using the text prompt.")
-                tpe = model.get_text_pe(names)
-                model.set_classes(names, tpe)
-                stats = super().__call__(model=deepcopy(model))
+            LOGGER.info("Validate using the text prompt.")
+            tpe = model.get_text_pe(names)
+            model.set_classes(names, tpe=tpe, vpe=None)
+        stats = super().__call__(trainer, model)
         return stats
