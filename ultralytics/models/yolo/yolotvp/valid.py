@@ -1,10 +1,8 @@
 import math
-from copy import deepcopy
 from pathlib import Path
 
 import torch
 from torch.nn import functional as F
-from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import LOGGER, TQDM
@@ -83,7 +81,10 @@ class YOLOTVPValidator(DetectionValidator):
             if crop is None:
                 continue
             crops.append(crop)
-        batch["visual_feats"] = self.visual_embeddings.to(batch["img"].device)
+        vpe = self.visual_embeddings.to(batch["img"].device)
+        if vpe.ndim == 2:
+            vpe = vpe.unsqueeze(0)
+        batch["visual_feats"] = vpe.expand(batch["img"].shape[0], -1, -1).contiguous()
         return batch
 
     @smart_inference_mode()
