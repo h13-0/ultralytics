@@ -275,7 +275,6 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
     def preprocess_batch(self, batch):
         """Extend preprocessing to include visual prompt embeddings."""
         batch = DetectionTrainer.preprocess_batch(self, batch)
-
         imgs = batch["img"]
         bboxes = batch.get("bboxes")
         batch_indices = batch.get("batch_idx")
@@ -286,11 +285,11 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
 
         model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
         head = de_parallel(model).model[-1]
+        nc = getattr(head, "base_nc", head.nc)
         embed_dim = getattr(head, "embed_dim", 512)
         batch_size = imgs.shape[0]
         num_boxes = bboxes.shape[0]
         device = self.device
-        dtype = imgs.dtype
 
         # 创建 CPU 版本的标注信息
         bboxes_cpu = bboxes.cpu()
@@ -301,14 +300,11 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         head.nc = max_bboxes
 
         if num_boxes == 0:
-            batch["visual_embeds"] = torch.zeros((0, embed_dim), device=device, dtype=dtype)
-            batch["visual_feats"] = torch.zeros(
-                (batch_size, max_bboxes, embed_dim), device=device, dtype=dtype
-            )
-            batch["visual_mask"] = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
+            batch["visual_feats"] = torch.zeros((batch_size, max_bboxes, embed_dim), device=device) #(B, max_boxes, dim)
             return batch
 
         image_cache = {}
+        dtype = imgs.dtype
         visual_embeds = torch.zeros((num_boxes, embed_dim), device=device, dtype=dtype)
         crops = []
         valid_indices = []
@@ -325,23 +321,17 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         if crops:
             # encoded = torch.stack([self.visual_embeddings[self.tensor_sha256(crop)] for crop in crops], dim=0)
             encoded = model.get_visual_pe(crops)
-            encoded = encoded.to(device=device, dtype=dtype)
+            encoded = encoded.to(device=device, dtype=imgs.dtype)
             for embed, idx in zip(encoded, valid_indices):
                 visual_embeds[idx] = embed
 
-        visual_feats = torch.zeros((batch_size, max_bboxes, embed_dim), device=device, dtype=dtype)
-        visual_mask = torch.zeros((batch_size, max_bboxes), dtype=torch.bool, device=device)
-        positions = [0] * batch_size
         for idx in range(num_boxes):
-            img_idx = int(batch_indices_cpu[idx].item())
-            col = positions[img_idx]
-            if col >= max_bboxes:
+            embed = visual_embeds[idx]
+            if not torch.any(embed):
                 continue
-            visual_feats[img_idx, col] = visual_embeds[idx]
-            positions[img_idx] += 1
-            visual_mask[img_idx, col] = True
 
-        batch["visual_feats"] = visual_feats
+
+        # batch["visual_feats"] = visual_feats
         return batch
 
     def validate(self):

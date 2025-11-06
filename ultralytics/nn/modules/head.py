@@ -577,7 +577,6 @@ class YOLOTVPDetect(Detect):
         super().__init__(nc, ch)
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-        self.base_nc = nc
         self.embed_dim = embed
 
         del self.cv2

@@ -760,7 +760,11 @@ class TVPDetectionLoss(v8DetectionLoss):
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        if "embeddings" not in batch:
+        tpe = batch.get("txt_feats", None)
+        vpe = batch.get("visual_feats", None)
+        embeds = [x for x in (tpe, vpe) if x is not None]
+        embeddings = torch.cat(embeds, dim=0) if embeds else None
+        if embeddings is None:
             return super().__call__(preds, batch)
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
@@ -795,7 +799,7 @@ class TVPDetectionLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
-            batch["embeddings"]
+            embeddings
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
