@@ -277,22 +277,25 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         batch = DetectionTrainer.preprocess_batch(self, batch)
         texts = list(itertools.chain(*batch["texts"]))
         visual_map = getattr(self, "visual_embeddings", None) or {}
-        aggregated = []
         eps = 1e-6
+        max_samples = 16
+        aggregated = []
         for text in texts:
             embed = None
             pool = visual_map.get(text) if isinstance(visual_map, dict) else None
             if isinstance(pool, torch.Tensor) and pool.ndim == 2 and pool.shape[0] > 0:
-                pool = pool.to(self.device)
                 num_samples = pool.shape[0]
-                sample_count = max(1, num_samples // 2)
-                indices = torch.randperm(num_samples, device=pool.device)[:sample_count]
-                sampled = pool[indices]
+                sample_count = min(max_samples, num_samples)
+                if num_samples == sample_count:
+                    sampled = pool[:sample_count]
+                else:
+                    start = torch.randint(0, num_samples - sample_count + 1, (1,), device=pool.device).item()
+                    sampled = pool[start : start + sample_count]
                 mean_embed = sampled.mean(dim=0)
                 norm = mean_embed.norm(p=2)
                 if norm > eps:
                     mean_embed = mean_embed / norm
-                embed = mean_embed
+                embed = mean_embed.to(self.device)
             if embed is None:
                 # fallback to text embeddings
                 embed = self.text_embeddings[text].to(self.device)
