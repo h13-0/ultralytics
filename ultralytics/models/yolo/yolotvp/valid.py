@@ -58,6 +58,27 @@ class YOLOTVPValidator(DetectionValidator):
             return None
         return crop.clone()
 
+    def build_dataset(self, img_path, mode="val", batch=None):
+        super().build_dataset(img_path, mode, batch)
+
+
+    def set_visual_embeddings(self, datasets, batch_size):
+        """
+        Set visual embeddings for datasets to accelerate training by caching category names.
+
+        This method collects unique category names from all datasets, then generates and caches text embeddings
+        for these categories to improve training efficiency.
+
+        Args:
+            datasets (List[Dataset]): List of datasets from which to extract category names.
+            batch_size (int | None): Batch size used for processing.
+        Notes:
+            This method collects category names from datasets that have the 'category_names' attribute,
+            then uses the first dataset's image path to determine where to cache the generated text embeddings.
+        """
+        pass
+
+
     def preprocess(self, batch):
         """Preprocess batch data, ensuring visuals are on the same device as images."""
         batch = super().preprocess(batch)

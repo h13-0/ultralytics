@@ -117,7 +117,7 @@ class CLIP(TextModel):
             >>> tokens = model.tokenize("a photo of a cat")
             >>> print(tokens.shape)  # torch.Size([1, 77])
         """
-        return clip.tokenize(texts).to(self.device)
+        return clip.tokenize(texts, truncate=True).to(self.device)
 
     @smart_inference_mode()
     def encode_text(self, texts, dtype=torch.float32):
@@ -577,3 +577,4 @@ def build_text_model(variant, device=None):
         raise ValueError(
             f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip', 'siliconflow'."
         )
+
