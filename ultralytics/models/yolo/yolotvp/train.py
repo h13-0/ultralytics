@@ -11,6 +11,7 @@ from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
 from ultralytics.data import build_dataloader, YOLOConcatDataset, build_yolo_dataset, build_grounding
+from ultralytics.data.augment import LoadVisualPrompt
 from .valid import YOLOTVPValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import RANK, DEFAULT_CFG, LOGGER, TQDM
@@ -275,6 +276,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
     def preprocess_batch(self, batch):
         """Extend preprocessing to include visual prompt embeddings."""
         batch = DetectionTrainer.preprocess_batch(self, batch)
+        batch["visual_mask"] = batch["visuals"].to(self.device)
         texts = list(itertools.chain(*batch["texts"]))
         visual_map = getattr(self, "visual_embeddings", None) or {}
         eps = 1e-6
@@ -304,12 +306,34 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         if aggregated:
             emb_tensor = torch.stack(aggregated, dim=0)
             emb_tensor = emb_tensor.reshape(len(batch["texts"]), -1, emb_tensor.shape[-1])
-            batch["visual_feats"] = emb_tensor
+            batch["visual_embeds"] = emb_tensor
         else:
-            batch["visual_feats"] = torch.empty(
+            batch["visual_embeds"] = torch.empty(
                 (len(batch["texts"]), 0, next(iter(self.text_embeddings.values())).shape[-1]),
                 device=self.device,
             )
+
+        batch_size, nc, embed = batch["visual_embeds"].shape
+        pred = self.model.predict(batch["img"], visual_mask=batch["visual_mask"], return_vft=True).cpu()
+        visual_feats = torch.zeros(batch_size, nc, embed, device="cpu", dtype=pred.dtype)
+        cls_counts = torch.zeros(batch_size, nc, device="cpu", dtype=torch.int)
+        for i in range(batch_size):
+            inst_mask = (batch["batch_idx"] == i).cpu()
+            cls_unique = batch["cls"][inst_mask].squeeze(-1).to(torch.int).unique(sorted=True).cpu()
+            if cls_unique.numel() == 0:
+                continue
+            vfeats = pred[i, : cls_unique.numel()]  # (num_cls_i, 512)
+            visual_feats[i].index_add_(0, cls_unique, vfeats)
+            cls_counts[i].index_add_(0, cls_unique, torch.ones_like(cls_unique, dtype=cls_counts.dtype))
+        nonzero_mask = cls_counts > 0
+        # 避免除零：先对非零的类求平均（如需要），再归一化
+        visual_feats[nonzero_mask] /= cls_counts[nonzero_mask][..., None]
+        visual_feats[nonzero_mask] = torch.nn.functional.normalize(
+            visual_feats[nonzero_mask], dim=-1, p=2
+        )
+        visual_feats[~nonzero_mask] = 0
+        batch["visual_feats"] = visual_feats
+
         return batch
 
     def validate(self):
@@ -368,6 +392,10 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             self.set_visual_embeddings(datasets, batch)
         else:
             datasets = [build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, multi_modal=True, stride=gs)]
+        
+        for d in datasets:
+            d.transforms.append(LoadVisualPrompt())
+
         return YOLOConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
 
     def get_batch_crops(self, batch, return_cls=False):

@@ -754,19 +754,13 @@ class E2EDetectLoss:
 
 class TVPDetectionLoss(v8DetectionLoss):
     """Criterion class for text-visual prompt detection with soft label cross-entropy."""
+
     def __init__(self, model, tal_topk=10):
         super().__init__(model, tal_topk)
         self.assigner = TVPTaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        tpe = batch.get("txt_feats", None)
-        vpe = batch.get("visual_feats", None)
-        embeds = [x for x in (tpe, vpe) if x is not None]
-        embeddings = torch.cat(embeds, dim=0) if embeds else None
-        if embeddings is None:
-            return super().__call__(preds, batch)
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -777,6 +771,18 @@ class TVPDetectionLoss(v8DetectionLoss):
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
+        device = pred_scores.device
+        loss = torch.zeros(3, device=device, dtype=dtype)  # box, cls, dfl
+
+        embeds = []
+        for pe in (batch.get("txt_feats", None), batch.get("visual_feats", None)):
+            if pe is None:
+                continue
+            embeds.append(pe.to(device=device, dtype=dtype))
+        embeddings = torch.cat(embeds, dim=1) if embeds else None
+        if embeddings is None:
+            return super().__call__(preds, batch)
+
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 

@@ -3,6 +3,9 @@ from pathlib import Path
 
 import torch
 from torch.nn import functional as F
+
+from ultralytics.data import YOLOConcatDataset
+from ultralytics.data.augment import LoadVisualPrompt
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.tasks import YOLOTVPModel
 from ultralytics.utils import LOGGER, TQDM
@@ -59,7 +62,13 @@ class YOLOTVPValidator(DetectionValidator):
         return crop.clone()
 
     def build_dataset(self, img_path, mode="val", batch=None):
-        super().build_dataset(img_path, mode, batch)
+        dataset = super().build_dataset(img_path, mode, batch)
+        if isinstance(dataset, YOLOConcatDataset):
+            for d in dataset.datasets:
+                d.transforms.append(LoadVisualPrompt())
+        else:
+            dataset.transforms.append(LoadVisualPrompt())
+        return dataset
 
 
     def set_visual_embeddings(self, datasets, batch_size):
@@ -84,7 +93,10 @@ class YOLOTVPValidator(DetectionValidator):
         batch = super().preprocess(batch)
         if "visuals" in batch:
             batch["visuals"] = batch["visuals"].to(batch["img"].device)
-
+            batch["visual_mask"] = batch["visuals"]
+        device = batch["img"].device
+        _, nc, embed = self.visual_embeddings.shape
+        batch_size = batch["img"].shape[0]
         imgs = batch["img"]
         bboxes = batch.get("bboxes")
         batch_indices = batch.get("batch_idx")
@@ -105,7 +117,29 @@ class YOLOTVPValidator(DetectionValidator):
         vpe = self.visual_embeddings.to(batch["img"].device)
         if vpe.ndim == 2:
             vpe = vpe.unsqueeze(0)
-        batch["visual_feats"] = vpe.expand(batch["img"].shape[0], -1, -1).contiguous()
+        batch["visual_embeds"] = vpe.expand(batch_size, -1, -1).contiguous()
+
+        pred = self.model.predict(batch["img"], visual_mask=batch["visual_mask"], return_vft=True)
+        visual_feats = torch.zeros(batch_size, nc, embed, device=device, dtype=pred.dtype)
+        cls_counts = torch.zeros(batch_size, nc, device=device, dtype=torch.int)
+        for i in range(batch_size):
+            inst_mask = batch["batch_idx"] == i
+            cls_unique = batch["cls"][inst_mask].squeeze(-1).to(torch.int).unique(sorted=True)
+            if cls_unique.numel() == 0:
+                continue
+            vfeats = pred[i, : cls_unique.numel()]  # (num_cls_i, 512)
+            visual_feats[i].index_add_(0, cls_unique, vfeats)
+            cls_counts[i].index_add_(0, cls_unique, torch.ones_like(cls_unique, dtype=cls_counts.dtype))
+        nonzero_mask = cls_counts > 0
+        # 避免除零：先对非零的类求平均（如需要），再归一化
+        visual_feats[nonzero_mask] /= cls_counts[nonzero_mask][..., None]
+        visual_feats[nonzero_mask] = torch.nn.functional.normalize(
+            visual_feats[nonzero_mask], dim=-1, p=2
+        )
+        visual_feats[~nonzero_mask] = 0
+        #visual_feats = visual_feats.expand(batch_size, -1, -1)
+        batch["visual_feats"] = visual_feats
+
         return batch
 
     @smart_inference_mode()
@@ -195,7 +229,6 @@ class YOLOTVPValidator(DetectionValidator):
 
         if load_vp:
             LOGGER.info("Validate using the visual prompt.")
-            self.args.half = False
             # Directly use the same dataloader for visual embeddings extracted during training
             vpe = self.get_visual_pe(self.dataloader, model)
             model.set_classes(names, tpe=None, vpe=vpe)

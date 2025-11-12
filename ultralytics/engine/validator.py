@@ -149,7 +149,7 @@ class BaseValidator:
             self.args.half = self.device.type != "cpu" and trainer.amp
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
-            # self.model = model
+            self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
@@ -164,7 +164,7 @@ class BaseValidator:
                 data=self.args.data,
                 fp16=self.args.half,
             )
-            # self.model = model
+            self.model = model
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
             stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
@@ -211,10 +211,11 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                tpe = batch.get("txt_feats", None)
-                vpe = batch.get("visual_feats", None)
-                if tpe is not None or vpe is not None:
-                    preds = model(batch["img"], tpe=tpe, vpe=vpe, augment=augment)
+                text_embeds = batch.get("text_embeds", None)
+                visual_embeds = batch.get("visual_embeds", None)
+                visual_feats = batch.get("visual_feats", None)
+                if text_embeds is not None or visual_embeds is not None:
+                    preds = model(batch["img"], text_embeds=text_embeds, visual_embeds=visual_embeds, visual_feats=visual_feats)
                 else:
                     preds = model(batch["img"], augment=augment)
 

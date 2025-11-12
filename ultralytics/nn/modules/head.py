@@ -592,34 +592,38 @@ class YOLOTVPDetect(Detect):
         self.detect = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
-        self.prompt_type_mask = None
+        self.savpe = SAVPE(ch, c3, embed)
+        self.log_lambda = nn.Parameter(torch.tensor(0.0), requires_grad=True)
         self.embed = embed
 
-    def forward(self, x, text_embed=None, visual_embed=None, return_mask=False):
+    def forward(self, x, text_embeds=None, visual_embeds=None, visual_feats=None):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         # if text_embed is None and visual_embed is None:
         #     raise ValueError("YOLOTVPDetect requires at least one of text_embed or visual_embed.")
 
-        if text_embed is not None:
-            if text_embed.ndim != 3:
-                raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embed.shape}.")
-            text_embed = text_embed.to(dtype=next(self.contrast_cls[0].parameters()).dtype)
+        if text_embeds is not None:
+            if text_embeds.ndim != 3:
+                raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embeds.shape}.")
+            text_embeds = text_embeds.to(dtype=next(self.contrast_cls[0].parameters()).dtype)
 
             for i in range(self.nl):
                 embed_cls = self.backbone2embed[i](x[i])
-                contrast_cls = self.contrast_cls[i](embed_cls, text_embed)
+                contrast_cls = self.contrast_cls[i](embed_cls, text_embeds)
                 detect = self.detect[i](x[i])
                 x[i] = torch.cat((detect, contrast_cls), dim=1)
 
-        if visual_embed is not None:
-            if visual_embed.ndim != 3:
-                raise ValueError(f"Expected visual_embed with 3 dimensions, but got shape {visual_embed.shape}.")
-            visual_embed = visual_embed.to(dtype=next(self.visual_proj.parameters()).dtype)
-            visual_embed = self.visual_proj(visual_embed)
+        if visual_embeds is not None and visual_feats is not None:
+            if visual_embeds.ndim != 3:
+                raise ValueError(f"Expected visual_embed with 3 dimensions, but got shape {visual_embeds.shape}.")
+            if visual_feats.ndim != 3:
+                raise ValueError(f"Expected visual_feats with 3 dimensions, but got shape {visual_feats.shape}.")
+            lam = self.log_lambda.exp()
+            vpe = (visual_feats * lam + visual_embeds) / (1 + lam)
+            vpe = torch.nn.functional.normalize(vpe, dim=-1, p=2)
 
             for i in range(self.nl):
                 embed_cls = self.backbone2embed[i](x[i])
-                contrast_cls = self.contrast_cls[i](embed_cls, visual_embed)
+                contrast_cls = self.contrast_cls[i](embed_cls, vpe)
                 detect = self.detect[i](x[i])
                 x[i] = torch.cat((detect, contrast_cls), dim=1)
 
@@ -637,6 +641,15 @@ class YOLOTVPDetect(Detect):
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[:] = 0.0
             c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+
+    def get_vft(self, x, vpe):
+        """Get visual feats with spatial awareness."""
+        if vpe.shape[1] == 0:  # no visual prompt embeddings
+            return torch.zeros(x[0].shape[0], 0, self.embed, device=x[0].device)
+        if vpe.ndim == 4:  # (B, N, H, W)
+            vpe = self.savpe(x, vpe)
+        assert vpe.ndim == 3  # (B, N, D)
+        return vpe
 
 
 class RTDETRDecoder(nn.Module):
