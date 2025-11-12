@@ -277,6 +277,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
         """Extend preprocessing to include visual prompt embeddings."""
         batch = DetectionTrainer.preprocess_batch(self, batch)
         batch["visual_mask"] = batch["visuals"].to(self.device)
+        model = self.model if isinstance(self.model, YOLOTVPModel) else self.model.module
         texts = list(itertools.chain(*batch["texts"]))
         visual_map = getattr(self, "visual_embeddings", None) or {}
         eps = 1e-6
@@ -314,7 +315,7 @@ class YOLOTVPVPTrainer(YOLOTVPTrainerFromScratch):
             )
 
         batch_size, nc, embed = batch["visual_embeds"].shape
-        pred = self.model.predict(batch["img"], visual_mask=batch["visual_mask"], return_vft=True).cpu()
+        pred = model.predict(batch["img"], visual_mask=batch["visual_mask"], return_vft=True).cpu()
         visual_feats = torch.zeros(batch_size, nc, embed, device="cpu", dtype=pred.dtype)
         cls_counts = torch.zeros(batch_size, nc, device="cpu", dtype=torch.int)
         for i in range(batch_size):
