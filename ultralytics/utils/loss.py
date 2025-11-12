@@ -808,7 +808,7 @@ class TVPDetectionLoss(v8DetectionLoss):
             embeddings
         )
 
-        target_scores_sum = max(target_scores.sum(), 1)
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
