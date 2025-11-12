@@ -649,7 +649,7 @@ class YOLOTVPDetect(Detect):
         if vpe.ndim == 4:  # (B, N, H, W)
             vpe = self.savpe(x, vpe)
         assert vpe.ndim == 3  # (B, N, D)
-        return vpe
+        return vpe.detach_().requires_grad_(False)
 
 
 class RTDETRDecoder(nn.Module):
