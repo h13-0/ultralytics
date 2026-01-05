@@ -6,7 +6,8 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors, \
+    TVPTaskAlignedAssigner
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -751,63 +752,77 @@ class E2EDetectLoss:
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
 
 
-class TVPDetectLoss:
-    """Criterion class for computing training losses for text-visual prompt detection."""
+class TVPDetectionLoss(v8DetectionLoss):
+    """Criterion class for text-visual prompt detection with soft label cross-entropy."""
 
-    def __init__(self, model):
-        """Initialize TVPDetectLoss with task-prompt and visual-prompt criteria using the provided model."""
-        self.vp_criterion = v8DetectionLoss(model)
-        # NOTE: store following info as it's changeable in __call__
-        self.ori_nc = self.vp_criterion.nc
-        self.ori_no = self.vp_criterion.no
-        self.ori_reg_max = self.vp_criterion.reg_max
+    def __init__(self, model, tal_topk=10):
+        super().__init__(model, tal_topk)
+        self.assigner = TVPTaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
 
     def __call__(self, preds, batch):
-        """Calculate the loss for text-visual prompt detection."""
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         feats = preds[1] if isinstance(preds, tuple) else preds
-        assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
 
-        if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
-            loss = torch.zeros(3, device=self.vp_criterion.device, requires_grad=True)
-            return loss, loss.detach()
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
-        vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion(vp_feats, batch)
-        box_loss = vp_loss[0][1]
-        return box_loss, vp_loss[1]
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        device = pred_scores.device
+        loss = torch.zeros(3, device=device, dtype=dtype)  # box, cls, dfl
 
-    def _get_vp_features(self, feats):
-        """Extract visual-prompt features from the model output."""
-        vnc = feats[0].shape[1] - self.ori_reg_max * 4 - self.ori_nc
+        embeds = []
+        for pe in (batch.get("txt_feats", None), batch.get("visual_feats", None)):
+            if pe is None:
+                continue
+            embeds.append(pe.to(device=device, dtype=dtype))
+        embeddings = torch.cat(embeds, dim=1) if embeds else None
+        if embeddings is None:
+            return super().__call__(preds, batch)
 
-        self.vp_criterion.nc = vnc
-        self.vp_criterion.no = vnc + self.vp_criterion.reg_max * 4
-        self.vp_criterion.assigner.num_classes = vnc
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        return [
-            torch.cat((box, cls_vp), dim=1)
-            for box, _, cls_vp in [xi.split((self.ori_reg_max * 4, self.ori_nc, vnc), dim=1) for xi in feats]
-        ]
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
+        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
-class TVPSegmentLoss(TVPDetectLoss):
-    """Criterion class for computing training losses for text-visual prompt segmentation."""
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+            embeddings
+        )
 
-    def __init__(self, model):
-        """Initialize TVPSegmentLoss with task-prompt and visual-prompt criteria using the provided model."""
-        super().__init__(model)
-        self.vp_criterion = v8SegmentationLoss(model)
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
 
-    def __call__(self, preds, batch):
-        """Calculate the loss for text-visual prompt segmentation."""
-        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
-        assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
-        if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
-            loss = torch.zeros(4, device=self.vp_criterion.device, requires_grad=True)
-            return loss, loss.detach()
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
 
-        vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
-        cls_loss = vp_loss[0][2]
-        return cls_loss, vp_loss[1]
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)

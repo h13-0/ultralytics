@@ -12,7 +12,8 @@ from torch.nn.init import constant_, xavier_uniform_
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN, ConstConv, \
+    TransformerAggregation, RConstConv, TextEncoderWithAttention
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -567,6 +568,144 @@ class YOLOESegment(YOLOEDetect):
             mc = (mc * mask.int()) if self.export and not self.dynamic else mc[..., mask]
 
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class YOLOTPDetect(Detect):
+    """Head for integrating YOLO detection models with semantic understanding from text and visual embeddings."""
+
+    def __init__(self, nc=80, embed=512, ch=()):
+        """Initialize YOLO detection layer with nc classes and layer channels ch."""
+        super().__init__(nc, ch)
+
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.embed_dim = embed
+
+        del self.cv2
+
+        self.backbone2embed = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
+        )
+
+        self.contrast_cls = nn.ModuleList(ContrastiveHead() for _ in ch)
+
+        self.detect = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.embed = embed
+
+    def forward(self, x, text_embeds=None, visual_embeds=None, visual_feats=None):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        # if text_embed is None and visual_embed is None:
+        #     raise ValueError("YOLOTVPDetect requires at least one of text_embed or visual_embed.")
+
+        if text_embeds is not None:
+            if text_embeds.ndim != 3:
+                raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embeds.shape}.")
+            text_embeds = text_embeds.to(dtype=next(self.contrast_cls[0].parameters()).dtype)
+
+            for i in range(self.nl):
+                embed_cls = self.backbone2embed[i](x[i])
+                contrast_cls = self.contrast_cls[i](embed_cls, text_embeds)
+                detect = self.detect[i](x[i])
+                x[i] = torch.cat((detect, contrast_cls), dim=1)
+
+        if self.training:
+            return x
+
+        self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        for a, b, c, s in zip(m.detect, m.backbone2embed, m.contrast_cls, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:] = 0.0
+            c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+
+
+class YOLOTVPDetect(Detect):
+    """Head for integrating YOLO detection models with semantic understanding from text and visual embeddings."""
+
+    def __init__(self, nc=80, embed=512, ch=()):
+        """Initialize YOLO detection layer with nc classes and layer channels ch."""
+        super().__init__(nc, ch)
+
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.embed_dim = embed
+
+        del self.cv2
+
+        self.backbone2embed = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch
+        )
+
+        self.visual_proj = Residual(SwiGLUFFN(embed, embed))
+
+        self.contrast_cls = nn.ModuleList(ContrastiveHead() for _ in ch)
+
+        self.detect = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.savpe = SAVPE(ch, c3, embed)
+        self.log_lambda = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.embed = embed
+
+    def forward(self, x, text_embeds=None, visual_embeds=None, visual_feats=None):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        # if text_embed is None and visual_embed is None:
+        #     raise ValueError("YOLOTVPDetect requires at least one of text_embed or visual_embed.")
+
+        if text_embeds is not None:
+            if text_embeds.ndim != 3:
+                raise ValueError(f"Expected text_embed with 3 dimensions, but got shape {text_embeds.shape}.")
+            text_embeds = text_embeds.to(dtype=next(self.contrast_cls[0].parameters()).dtype)
+
+            for i in range(self.nl):
+                embed_cls = self.backbone2embed[i](x[i])
+                contrast_cls = self.contrast_cls[i](embed_cls, text_embeds)
+                detect = self.detect[i](x[i])
+                x[i] = torch.cat((detect, contrast_cls), dim=1)
+
+        if visual_embeds is not None and visual_feats is not None:
+            if visual_embeds.ndim != 3:
+                raise ValueError(f"Expected visual_embed with 3 dimensions, but got shape {visual_embeds.shape}.")
+            if visual_feats.ndim != 3:
+                raise ValueError(f"Expected visual_feats with 3 dimensions, but got shape {visual_feats.shape}.")
+            lam = self.log_lambda.exp()
+            vpe = (visual_feats * lam + visual_embeds) / (1 + lam)
+            vpe = torch.nn.functional.normalize(vpe, dim=-1, p=2)
+
+            for i in range(self.nl):
+                embed_cls = self.backbone2embed[i](x[i])
+                contrast_cls = self.contrast_cls[i](embed_cls, vpe)
+                detect = self.detect[i](x[i])
+                x[i] = torch.cat((detect, contrast_cls), dim=1)
+
+        if self.training:
+            return x
+
+        self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        for a, b, c, s in zip(m.detect, m.backbone2embed, m.contrast_cls, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:] = 0.0
+            c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+
+    def get_vft(self, x, vpe):
+        """Get visual feats with spatial awareness."""
+        if vpe.shape[1] == 0:  # no visual prompt embeddings
+            return torch.zeros(x[0].shape[0], 0, self.embed, device=x[0].device)
+        if vpe.ndim == 4:  # (B, N, H, W)
+            vpe = self.savpe(x, vpe)
+        assert vpe.ndim == 3  # (B, N, D)
+        return vpe.detach_().requires_grad_(False)
 
 
 class RTDETRDecoder(nn.Module):

@@ -2,9 +2,11 @@
 
 from abc import abstractmethod
 from pathlib import Path
+import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.utils import checks
 from ultralytics.utils.torch_utils import smart_inference_mode
@@ -33,14 +35,22 @@ class TextModel(nn.Module):
         super().__init__()
 
     @abstractmethod
-    def tokenize(texts):
+    def tokenize(self, texts):
         """Convert input texts to tokens for model processing."""
         pass
 
     @abstractmethod
-    def encode_text(texts, dtype):
+    def encode_text(self, texts, dtype):
         """Encode tokenized texts into normalized feature vectors."""
         pass
+
+    def preprocess_images(self, images):
+        """Preprocess image inputs before encoding. Subclasses should override if image encoding is supported."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement image preprocessing.")
+
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """Encode image inputs into feature vectors. Subclasses should override if image encoding is supported."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement image encoding.")
 
 
 class CLIP(TextModel):
@@ -86,7 +96,8 @@ class CLIP(TextModel):
             >>> text_features = clip_model.encode_text(["a photo of a cat", "a photo of a dog"])
         """
         super().__init__()
-        self.model = clip.load(size, device=device)[0]
+        self.model, preprocess = clip.load(size, device=device)
+        self.preprocess = preprocess
         self.to(device)
         self.device = device
         self.eval()
@@ -106,7 +117,7 @@ class CLIP(TextModel):
             >>> tokens = model.tokenize("a photo of a cat")
             >>> print(tokens.shape)  # torch.Size([1, 77])
         """
-        return clip.tokenize(texts).to(self.device)
+        return clip.tokenize(texts, truncate=True).to(self.device)
 
     @smart_inference_mode()
     def encode_text(self, texts, dtype=torch.float32):
@@ -133,6 +144,59 @@ class CLIP(TextModel):
         txt_feats = self.model.encode_text(texts).to(dtype)
         txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
         return txt_feats
+
+    def preprocess_images(self, images):
+        """
+        Apply CLIP preprocessing to image inputs.
+
+        Args:
+            images (list | tuple | torch.Tensor | PIL.Image): Image data to preprocess.
+
+        Returns:
+            (torch.Tensor): Preprocessed image batch tensor.
+        """
+        if isinstance(images, torch.Tensor):
+            return images if images.ndim == 4 else images.unsqueeze(0)
+
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        to_pil_image = None
+        processed = []
+        for img in images:
+            if isinstance(img, torch.Tensor):
+                if to_pil_image is None:
+                    try:
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    except ImportError:
+                        checks.check_requirements("torchvision")
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    to_pil_image = _to_pil_image
+                img = to_pil_image(img.cpu())
+            processed.append(self.preprocess(img))
+        return torch.stack(processed, dim=0)
+
+    @smart_inference_mode()
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """
+        Encode images into CLIP visual embeddings.
+
+        Args:
+            images (Any): Image inputs compatible with ``preprocess_images`` or already preprocessed tensors.
+            preprocess (bool): Whether to run preprocessing before encoding.
+            dtype (torch.dtype): Desired output dtype.
+
+        Returns:
+            (torch.Tensor): L2-normalized image embeddings.
+        """
+        if preprocess:
+            images = self.preprocess_images(images)
+        if isinstance(images, (list, tuple)):
+            images = torch.stack(images, dim=0)
+        images = images.to(self.device)
+        feats = self.model.encode_image(images).to(dtype)
+        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+        return feats
 
 
 class MobileCLIP(TextModel):
@@ -197,7 +261,9 @@ class MobileCLIP(TextModel):
             from ultralytics import download
 
             download(f"https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/{file}")
-        self.model = mobileclip.create_model_and_transforms(f"mobileclip_{config}", pretrained=file, device=device)[0]
+        model, _, transforms = mobileclip.create_model_and_transforms(f"mobileclip_{config}", pretrained=file, device=device)
+        self.model = model
+        self.preprocess = transforms[-1] if isinstance(transforms, (tuple, list)) else transforms
         self.tokenizer = mobileclip.get_tokenizer(f"mobileclip_{config}")
         self.to(device)
         self.device = device
@@ -241,6 +307,155 @@ class MobileCLIP(TextModel):
         text_features = self.model.encode_text(texts).to(dtype)
         text_features /= text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features
+
+    def preprocess_images(self, images):
+        """
+        Apply MobileCLIP preprocessing to image inputs.
+
+        Args:
+            images (list | tuple | torch.Tensor | PIL.Image): Image data to preprocess.
+
+        Returns:
+            (torch.Tensor): Preprocessed image batch tensor.
+        """
+        if isinstance(images, torch.Tensor):
+            return images if images.ndim == 4 else images.unsqueeze(0)
+
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        to_pil_image = None
+        processed = []
+        for img in images:
+            if isinstance(img, torch.Tensor):
+                if to_pil_image is None:
+                    try:
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    except ImportError:
+                        checks.check_requirements("torchvision")
+                        from torchvision.transforms.functional import to_pil_image as _to_pil_image
+                    to_pil_image = _to_pil_image
+                img = to_pil_image(img.cpu())
+            processed.append(self.preprocess(img))
+        return torch.stack(processed, dim=0)
+
+    @smart_inference_mode()
+    def encode_image(self, images, *, preprocess=True, dtype=torch.float32):
+        """
+        Encode images into MobileCLIP visual embeddings.
+
+        Args:
+            images (Any): Image inputs compatible with ``preprocess_images`` or preprocessed tensors.
+            preprocess (bool): Whether to apply preprocessing before encoding.
+            dtype (torch.dtype): Desired output dtype.
+
+        Returns:
+            (torch.Tensor): L2-normalized image embeddings.
+        """
+        if preprocess:
+            images = self.preprocess_images(images)
+        if isinstance(images, (list, tuple)):
+            images = torch.stack(images, dim=0)
+        images = images.to(self.device)
+        feats = self.model.encode_image(images).to(dtype)
+        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+        return feats
+
+
+class SiliconFlowEmbed(TextModel):
+    """
+    Text encoder backed by SiliconFlow's hosted BGE models.
+
+    This encoder forwards text inputs to SiliconFlow's embedding API and returns normalized torch tensors so they can
+    be consumed like locally hosted models.
+    """
+
+    def __init__(self, model_name, api_token, device=None, api_url="https://api.siliconflow.cn/v1/embeddings"):
+        """
+        Initialize a SiliconFlow BGE encoder.
+
+        Args:
+            model_name (str): Remote model identifier, e.g. ``"BAAI/bge-large-zh-v1.5"``.
+            api_token (str): SiliconFlow API token used for authentication.
+            device (torch.device | str | None): Target device for returning embeddings. Defaults to CPU.
+            api_url (str): Embedding endpoint URL.
+        """
+        try:
+            import requests
+        except ImportError:  # pragma: no cover - handled via runtime dependency check
+            checks.check_requirements("requests")
+            import requests
+
+        super().__init__()
+        self.model_name = model_name
+        self.api_token = api_token
+        self.api_url = api_url
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+
+    def tokenize(self, texts):
+        """
+        BGE cloud models accept raw strings, so tokenization is a pass-through.
+
+        Args:
+            texts (Any): Input text(s).
+
+        Returns:
+            Any: Same value that was provided.
+        """
+        return texts
+
+    @smart_inference_mode()
+    def encode_text(self, texts, dtype=torch.float32):
+        """
+        Request SiliconFlow embeddings for the provided texts.
+
+        Args:
+            texts (str | Sequence[str]): Text inputs (raw strings).
+            dtype (torch.dtype): Desired dtype for the resulting tensor.
+
+        Returns:
+            torch.Tensor: L2-normalized embeddings shaped (batch, dim).
+        """
+        import requests
+        if isinstance(texts, str):
+            inputs = [texts]
+        elif isinstance(texts, (list, tuple)):
+            inputs = list(texts)
+        else:
+            try:
+                inputs = list(texts)
+            except TypeError as exc:
+                raise TypeError("SiliconFlowEmbed.encode_text expects a string or sequence of strings.") from exc
+
+        if not inputs or not all(isinstance(item, str) for item in inputs):
+            raise TypeError("SiliconFlowEmbed.encode_text expects non-empty string inputs.")
+
+        payload = {"model": self.model_name, "input": inputs if len(inputs) > 1 else inputs[0]}
+        headers = {"Authorization": f"Bearer {self.api_token}", "Content-Type": "application/json"}
+
+        body = None
+        for attempt in range(3):
+            try:
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+                response.raise_for_status()
+                body = response.json()
+                break
+            except requests.RequestException as exc:  # pragma: no cover - network failures depend on runtime
+                if attempt == 2:
+                    raise RuntimeError("Failed to fetch embeddings from SiliconFlow.") from exc
+                time.sleep(1.5 * (attempt + 1))
+
+        data = body.get("data") if isinstance(body, dict) else None
+        if not data:
+            raise RuntimeError("SiliconFlow response did not contain any embeddings.")
+
+        embeddings = [item.get("embedding") for item in data if isinstance(item, dict)]
+        if len(embeddings) != len(inputs) or any(embedding is None for embedding in embeddings):
+            raise RuntimeError("SiliconFlow response is missing embedding vectors.")
+
+        features = torch.tensor(embeddings, dtype=dtype, device=self.device)
+        normalized = F.normalize(features, p=2, dim=-1)
+        return normalized.clone()
 
 
 class MobileCLIPTS(TextModel):
@@ -342,11 +557,24 @@ def build_text_model(variant, device=None):
     Examples:
         >>> model = build_text_model("clip:ViT-B/32", device=torch.device("cuda"))
         >>> model = build_text_model("mobileclip:s0", device=torch.device("cpu"))
+        >>> model = build_text_model("siliconflow:BAAI/bge-large-zh-v1.5@<token>")
     """
-    base, size = variant.split(":")
+    base, size = variant.split(":", 1)
     if base == "clip":
         return CLIP(size, device)
     elif base == "mobileclip":
-        return MobileCLIPTS(device)
+        return MobileCLIP(size, device)
+    elif base == "siliconflow":
+        if "@" not in size:
+            raise ValueError("SiliconFlow variants must be formatted as 'siliconflow:model@token'.")
+        model_name, api_token = size.split("@", 1)
+        model_name = model_name.strip()
+        api_token = api_token.strip()
+        if not model_name or not api_token:
+            raise ValueError("Both model name and token are required for SiliconFlow variants.")
+        return SiliconFlowEmbed(model_name, api_token, device=device)
     else:
-        raise ValueError(f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip'.")
+        raise ValueError(
+            f"Unrecognized base model: '{base}'. Supported base models: 'clip', 'mobileclip', 'siliconflow'."
+        )
+

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -68,6 +69,8 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    YOLOTPDetect,
+    YOLOTVPDetect,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -77,7 +80,7 @@ from ultralytics.utils.loss import (
     v8DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
-    v8SegmentationLoss,
+    v8SegmentationLoss, TVPDetectionLoss,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -1072,6 +1075,207 @@ class YOLOESegModel(YOLOEModel, SegmentationModel):
             preds = self.forward(batch["img"], tpe=batch.get("txt_feats", None), vpe=batch.get("visuals", None))
         return self.criterion(preds, batch)
 
+class YOLOTVPModel(DetectionModel):
+    """YOLOv8 Text-Visual Prompt Model."""
+
+    def __init__(self, cfg="yolo11-tvp.yaml", ch=3, nc=None, verbose=True):
+        """
+        Initialize YOLOv8 world model with given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Whether to display model information.
+        """
+        self.variant = "mobileclip:blt"
+        self.tpe = None #torch.randn(1, nc or 80, 512)  # features placeholder
+        self.vpe = None #torch.randn(1, nc or 80, 512)  # features placeholder
+        self.clip_model = None  # legacy attribute retained for compatibility
+        self._clip_cache = None  # avoid registering CLIP models as submodules
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+
+    def set_classes(self, names, tpe, vpe):
+        """
+        Set classes in advance so that model could do offline-inference without clip model.
+
+        Args:
+            names (List[str]): List of class names.
+            embeddings (torch.Tensor): Embeddings tensor.
+        """
+        self.tpe = tpe
+        self.vpe = vpe
+        self.model[-1].nc = len(names)
+        self.names = check_class_names(names)
+
+    @smart_inference_mode()
+    def get_text_pe(self, text, batch=80, cache_clip_model=False):
+        """
+        Set classes in advance so that model could do offline-inference without clip model.
+
+        Args:
+            text (List[str]): List of class names.
+            batch (int): Batch size for processing text tokens.
+            cache_clip_model (bool): Whether to cache the CLIP model.
+
+        Returns:
+            (torch.Tensor): Text positional embeddings.
+        """
+        device = next(self.model.parameters()).device
+        clip_model = self._get_clip_model(self.variant, device=device, cache=cache_clip_model)
+
+        tokens = clip_model.tokenize(text)
+        txt_feats = []
+        for token_chunk in tokens.split(batch):
+            with torch.no_grad():
+                feats = clip_model.encode_text(token_chunk, dtype=torch.float32)
+            txt_feats.append(feats.detach())
+        txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
+        txt_feats = F.normalize(txt_feats, dim=-1, eps=1e-6)
+        txt_feats = txt_feats.to(dtype=next(self.model.parameters()).dtype)
+        return txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
+
+    @smart_inference_mode()
+    def get_visual_pe(self, img, visual_mask=None):
+        """
+        Encode visual embeddings.
+
+        - In training mode or when no additional visual propmt information is provided, 
+            only perform CLIP encoding on the input image.
+
+        Args:
+            img (torch.Tensor | PIL.Image | List): Input image.
+            visual (bool): If True, save feature maps for visualization.
+
+        Returns:
+            (torch.Tensor): Visual propmt embedding.
+        """
+        if visual_mask is None:
+            device = next(self.model.parameters()).device
+            clip_model = self._get_clip_model(self.variant, device=device, cache=True)
+
+            processed = clip_model.preprocess_images(img)
+            if isinstance(processed, (list, tuple)):
+                processed = torch.stack(processed, dim=0)
+            processed = processed.to(device)
+
+            with torch.no_grad():
+                feats = clip_model.encode_image(processed, preprocess=False, dtype=torch.float32)
+            feats = F.normalize(feats, dim=-1, eps=1e-6)
+            target_dtype = next(self.model.parameters()).dtype
+            return feats.to(dtype=target_dtype, device=device)
+        else:
+            return self.model[-1].get_vft(x, visual_mask)
+
+
+    def _get_clip_model(self, variant, device, cache=True):
+        """
+        Build or reuse a CLIP/MobileCLIP model without registering it as a submodule.
+
+        Args:
+            variant (str): CLIP variant string, e.g., "clip:ViT-B/32".
+            device (torch.device): Target device.
+            cache (bool): Whether to store and reuse the model.
+
+        Returns:
+            (TextModel): Multimodal encoder for text/image prompts.
+        """
+        from ultralytics.nn.text_model import build_text_model
+
+        if not cache:
+            return build_text_model(variant, device=device)
+
+        cache_entry = self._clip_cache
+        if cache_entry is None or cache_entry.get("variant") != variant:
+            clip_model = build_text_model(variant, device=device)
+            self._clip_cache = {"variant": variant, "model": clip_model}
+        else:
+            clip_model = cache_entry["model"]
+        return clip_model
+
+
+    def predict(self,
+                x, profile=False, visualize=False, text_embeds=None, visual_embeds=None, visual_feats=None,
+                visual_mask=None, embed=None, return_vft=False
+        ):
+        """
+        Perform a forward pass through the model.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+            profile (bool): If True, profile the computation time for each layer.
+            visualize (bool): If True, save feature maps for visualization.
+            text_embeds (torch.Tensor, optional): The text features, use it if it's given.
+            visual_embeds (torch.Tensor, optional): Visual prompts aligned with the text prompts.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): Model's output tensor.
+        """
+        if text_embeds is not None:
+            text_embeds = text_embeds.to(device=x.device, dtype=x.dtype)
+            if len(text_embeds) != len(x) or self.model[-1].export:
+                text_embeds = text_embeds.expand(x.shape[0], -1, -1)
+
+        if visual_embeds is not None:
+            visual_embeds = visual_embeds.to(device=x.device, dtype=x.dtype)
+
+        if visual_feats is not None:
+            visual_feats = visual_feats.to(device=x.device, dtype=x.dtype)
+
+        y, dt, embeddings = [], [], []  # outputs
+        for m in self.model:  # except the head part
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+
+            if isinstance(m, YOLOTVPDetect):
+                if return_vft:
+                    visual_feats = m.get_vft(x, visual_mask) if visual_mask is not None else None
+                    # visual_feats.shape = [B, exist_class, embed]
+                    return visual_feats
+                else:
+                    # visual_feats.shape = [B, nc, embed]
+                    x = m(x, text_embeds, visual_embeds, visual_feats)
+            elif isinstance(m, ImagePoolingAttn):
+                text_embeds = m(x, text_embeds)
+            else:
+                x = m(x)  # run
+
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
+
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on.
+            preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        if preds is None:
+            text_embeds = batch.get("text_embeds", batch.get("embeddings"))
+            visual_embeds = batch.get("visual_embeds")
+            visual_mask = batch.get("visual_mask", None)
+            visual_feats = batch.get("visual_feats", None)
+            preds = self.forward(batch["img"], text_embeds=text_embeds, visual_embeds=visual_embeds, visual_feats=visual_feats, visual_mask=visual_mask)
+        return self.criterion(preds, batch)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else TVPDetectionLoss(self)
+
 
 class Ensemble(torch.nn.ModuleList):
     """Ensemble of models."""
@@ -1497,7 +1701,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, YOLOTPDetect, YOLOTVPDetect, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
@@ -1619,7 +1823,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
+            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect, YOLOTPDetect, YOLOTVPDetect)):
                 return "detect"
 
     # Guess from model filename
