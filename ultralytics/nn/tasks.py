@@ -1166,7 +1166,7 @@ class YOLOTVPModel(DetectionModel):
             target_dtype = next(self.model.parameters()).dtype
             return feats.to(dtype=target_dtype, device=device)
         else:
-            return self.model[-1].get_vft(x, visual_mask)
+            return self.model[-1].get_vft(img, visual_mask)
 
 
     def _get_clip_model(self, variant, device, cache=True):
@@ -1195,10 +1195,20 @@ class YOLOTVPModel(DetectionModel):
         return clip_model
 
 
-    def predict(self,
-                x, profile=False, visualize=False, text_embeds=None, visual_embeds=None, visual_feats=None,
-                visual_mask=None, embed=None, return_vft=False
-        ):
+    def predict(
+        self,
+        x,
+        profile=False,
+        visualize=False,
+        text_embeds=None,
+        visual_embeds=None,
+        visual_feats=None,
+        visual_mask=None,
+        embed=None,
+        return_vft=False,
+        augment=False,
+        **kwargs,
+    ):
         """
         Perform a forward pass through the model.
 
@@ -1213,6 +1223,13 @@ class YOLOTVPModel(DetectionModel):
         Returns:
             (torch.Tensor): Model's output tensor.
         """
+        if text_embeds is None and self.tpe is not None:
+            text_embeds = self.tpe
+        if visual_embeds is None and self.vpe is not None:
+            visual_embeds = self.vpe
+        if visual_feats is None and visual_embeds is not None:
+            visual_feats = visual_embeds
+
         if text_embeds is not None:
             text_embeds = text_embeds.to(device=x.device, dtype=x.dtype)
             if len(text_embeds) != len(x) or self.model[-1].export:
@@ -1220,9 +1237,13 @@ class YOLOTVPModel(DetectionModel):
 
         if visual_embeds is not None:
             visual_embeds = visual_embeds.to(device=x.device, dtype=x.dtype)
+            if len(visual_embeds) != len(x) or self.model[-1].export:
+                visual_embeds = visual_embeds.expand(x.shape[0], -1, -1)
 
         if visual_feats is not None:
             visual_feats = visual_feats.to(device=x.device, dtype=x.dtype)
+            if len(visual_feats) != len(x) or self.model[-1].export:
+                visual_feats = visual_feats.expand(x.shape[0], -1, -1)
 
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:  # except the head part
